@@ -103,7 +103,25 @@ class Trainer:
                 print(name)
             
         self.load_anest() # Loading Dataset
+        #self.load_mnist()
         
+    def load_mnist(self):
+        transform=transforms.Compose([
+            transforms.ToTensor()
+        ])
+        train_mnist = datasets.MNIST(
+            '../data/mnist_torch/',
+            train=True, download=True, transform=transform,
+        )
+        test_mnist = datasets.MNIST(
+            '../data/mnist_torch/',
+            train=False, download=True, transform=transform,
+        )
+        self.train_dataset = None # Deallocate        
+        self.val_dataset = None # Deallocate
+        self.train_dataset = SpikeTrainMNIST(train_mnist, 'train', self.CFG2)
+        self.val_dataset = SpikeTrainMNIST(test_mnist, 'validation', self.CFG2) # or test after validation
+
     def load_anest(self): 
         ## Loading and Preprocessing Dataset (Anesthesia Dataset), Replace with other dataset
         
