@@ -258,6 +258,7 @@ class Trainer:
 
         info = mne.create_info(ch_names=info['ch_names'], sfreq=info['sfreq'], ch_types='eeg')
         raw = mne.io.RawArray(eeg_data_all, info)#[0,0][15]
+        #raw = raw.copy().filter(2,60,verbose=False) #tried before and after filter
         raw.set_montage(montage);
        
         del eeg_data_list, eeg_data, info, mat_files
