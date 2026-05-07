@@ -41,6 +41,8 @@ Misc: tqdm, h5io, pillow, ipykernel, imbalanced-learn
   - bnn_intralayer.py: all models (same for all codes)
   - mnist_spike_train_sliding*.py: input adjustments (two versions)
   - trainnospikemne*.py: dataset and training (same train functions, different load files for different datasets)
+    - self.load_anest() or self.load_mnist() depending on dataset
+    - change load_anest() depending on dataset
 
 
 
