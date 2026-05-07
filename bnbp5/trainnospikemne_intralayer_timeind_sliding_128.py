@@ -33,6 +33,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 base_folder = '/nfs/turbo/lsa-forger/mccruz/Anesthesia'
 
 def create_epochs_from_event(start, duration, event_id, raw, epoch_duration=4, tmin = -0.2, sfreq=500, max_num_epochs=10000000000):
+    # Create epochs from events
     tmax = epoch_duration + 0.2
     epochs_list = []
     # Create epochs within the event's duration
@@ -56,6 +57,7 @@ def create_epochs_from_event(start, duration, event_id, raw, epoch_duration=4, t
     return epochs_list
 
 def equal_class_split(X, y, per_class_samples):
+    # Ensure equal number of samples per class
     X_np = X.numpy() if isinstance(X, torch.Tensor) else X
     y_np = y.numpy() if isinstance(y, torch.Tensor) else y
 
@@ -100,9 +102,10 @@ class Trainer:
             if param.requires_grad:
                 print(name)
             
-        self.load_anest()
+        self.load_anest() # Loading Dataset
         
     def load_anest(self): 
+        ## Loading and Preprocessing Dataset (Anesthesia Dataset), Replace with other dataset
         
         # .sfp file
         file_path = base_folder + '/EGI_ChannelLocations/GSN-HydroCel-128.sfp'
@@ -272,6 +275,7 @@ class Trainer:
 
         del raw, epochs, eeg_data_all #, all_epochs_list, epochs_list
         
+        # Assigining classes
         if self.num_classes == 6:
             print("6")
             y[y<=2] = 0
@@ -370,7 +374,7 @@ class Trainer:
         self.train_dataset = None # Deallocate        
         self.val_dataset = None # Deallocate
         self.train_dataset = MNISTBrain(x_train, y_train, 'train', self.CFG2)
-        self.val_dataset = MNISTBrain(x_test, y_test, 'validation', self.CFG2)
+        self.val_dataset = MNISTBrain(x_test, y_test, 'validation', self.CFG2) # or test after validation
         
         
     def load_model_from_file(self, pretrained):

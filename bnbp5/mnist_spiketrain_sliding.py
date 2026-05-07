@@ -77,9 +77,7 @@ class MNISTBrain(Dataset):
             print("spiketrains", self.spiketrains.shape)
 
         else:
-            # reshaping 1/18
-            #self.spiketrains = self.spiketrains.reshape(-1, self.spiketrains.shape[1]*self.spiketrains.shape[2]).unsqueeze(1).repeat(1, 2000, 1)
-
+            # reshaping to adjust for time
             le = 10#100#400#300#200
             self.spiketrains = inputdata[:n_samples, 0:le, :]
             tdt = 10
