@@ -21,13 +21,11 @@ python -m ipykernel install --user --name=bnn-stages --display-name "Python (bnn
 
 Numerical/Scientific: numpy, scipy, pandas, h5py, mne, matplotlib
 
-Deep Learning: torch, torchvision, torchmetrics, torch-geometric, snntorch, torchdiffeq, torcheval, pytorch-lightning, fastai
+Deep Learning: torch, torchvision, snntorch
 
 Utilities: jaxtyping, zanj, muutils, albumentations, datasets
 
-Visualization: seaborn, plotly
-
-Misc: tqdm, h5io, pillow, ipykernel, imbalanced-learn
+Misc: ipykernel
 
 ## Files in BNN-EEG Folder (Codes Folder)
 

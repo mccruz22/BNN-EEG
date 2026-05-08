@@ -17,8 +17,8 @@ dependencies:
   - matplotlib=3.7.1
   - scikit-learn=1.5.1
   #- nilearn=0.11.1
-  - tqdm=4.66.4
-  - pillow=9.5.0
+  #- tqdm=4.66.4
+  #- pillow=9.5.0
   - ipykernel>=6.25.0
 
   # PyTorch (CPU version from conda)
@@ -41,4 +41,4 @@ dependencies:
       - datasets==2.20.0
       #- albumentations==1.4.11
       #- typing-extensions==4.10.0
-      - h5io==0.1.9
+      #- h5io==0.1.9
