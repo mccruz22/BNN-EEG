@@ -29,7 +29,7 @@ Visualization: seaborn, plotly
 
 Misc: tqdm, h5io, pillow, ipykernel, imbalanced-learn
 
-## Files in Anesthesia_Basic Folder (Codes Folder)
+## Files in BNN-EEG Folder (Codes Folder)
 
 - run_model.ipynb - training; run using Jupyter or can convert to.py
 - Analyze_BNN_Anesthesia.ipynb - accuracies, weights, etc.
