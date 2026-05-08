@@ -29,48 +29,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 base_folder = '/nfs/turbo/lsa-forger/mccruz/Anesthesia'
 
-def create_epochs_from_event(start, duration, event_id, raw, epoch_duration=4, tmin = -0.2, sfreq=500, max_num_epochs=10000000000):
-    # Create epochs from events
-    tmax = epoch_duration + 0.2
-    epochs_list = []
-    # Create epochs within the event's duration
-    current_start = start/sfreq
-    num_epochs = 0
-    while (current_start*sfreq + epoch_duration <= start + duration) and (num_epochs <= max_num_epochs):
-        print("CURRENT START",current_start * sfreq)
-        event_array = np.array([[int(current_start * sfreq), 0, event_id]])
-        epoch = mne.Epochs(
-            raw,
-            event_array,
-            event_id=event_id,
-            tmin=tmin,
-            tmax=tmax,
-            baseline=None
-        )
-        epochs_list.append(epoch)
-        current_start += epoch_duration  # Move to the next segment
-        num_epochs +=1 
-        print(num_epochs)
-    return epochs_list
-
-def equal_class_split(X, y, per_class_samples):
-    # Ensure equal number of samples per class
-    X_np = X.numpy() if isinstance(X, torch.Tensor) else X
-    y_np = y.numpy() if isinstance(y, torch.Tensor) else y
-
-    X_balanced, y_balanced = [], []
-
-    for cls in np.unique(y_np):
-        idx = np.where(y_np == cls)[0]
-        np.random.shuffle(idx)
-        selected = idx[:per_class_samples]
-        X_balanced.append(X_np[selected])
-        y_balanced.append(y_np[selected])
-
-    X_balanced = torch.tensor(np.concatenate(X_balanced), dtype=torch.float32)
-    y_balanced = torch.tensor(np.concatenate(y_balanced), dtype=torch.long)
-    return X_balanced, y_balanced
-
 class Trainer:
     """
     Training and Validating, and Measuring sliding gradients for a single sample
