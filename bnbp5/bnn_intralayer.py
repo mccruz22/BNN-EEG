@@ -559,7 +559,6 @@ class model_HH_IBN(nn.Module):
         return torch.sigmoid((V - Vt) / Kp)
    
 NEURON_MODELS: dict[str, object] = {
-    "model_FH": model_FH,
     "model_HH_Synaptic": model_HH_Synaptic,
     "model_HH_Gap": model_HH_Gap,
     "model_HH_RS": model_HH_RS,

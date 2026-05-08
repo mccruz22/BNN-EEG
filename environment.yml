@@ -44,7 +44,6 @@ dependencies:
       - muutils==0.5.1
       - seaborn==0.12.2
       - plotly==5.20.0
-      - bokeh==2.5.3
       - datasets==2.20.0
       - albumentations==1.4.11
       - typing-extensions==4.10.0
