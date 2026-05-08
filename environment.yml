@@ -22,7 +22,6 @@ dependencies:
   - ipykernel>=6.25.0
 
   # PyTorch (CPU version from conda)
-  # If you want CUDA, tell me and I’ll make a CUDA-specific env
   - pytorch=2.2.1
   - torchvision=0.17.1
   - torchaudio=2.2.1

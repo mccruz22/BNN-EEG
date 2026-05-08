@@ -102,8 +102,8 @@ class Trainer:
             if param.requires_grad:
                 print(name)
             
-        self.load_anest() # Loading Dataset
-        #self.load_mnist()
+        #self.load_anest() # Loading Dataset
+        self.load_mnist()
         
     def load_mnist(self):
         transform=transforms.Compose([
