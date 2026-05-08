@@ -6,8 +6,7 @@ Python-based project for Biological Neural Network modeling and analysis for EEG
 
 ## Installation
 
-Copy the project code and data (if using EEG data).
-
+Copy the project code and data (if using EEG data). Deidentified data that supports our finding are available from the authors upon reasonable request. Code completely runs with MNIST dataset if you don't have an EEG dataset.
 
 ## Environtment-Setup
 
@@ -31,7 +30,8 @@ Misc: ipykernel
 
 - run_model.ipynb - training; run using Jupyter or can convert to.py
 - Analyze_BNN_Anesthesia.ipynb - accuracies, weights, etc.
-- BNN_*.pth - training files
+- BNN_*.pth - training files (when trained)
+- HebbianLearning.ipynb - running and visualizing gradients
 
 ## Files in /bnbp5 Folder
 
