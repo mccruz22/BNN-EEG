@@ -5,11 +5,8 @@ from os.path import exists
 import matplotlib.pyplot as plt
 
 from torch import nn
-from typing import Type
-from jaxtyping import Float
 
 from muutils.json_serialize import serializable_dataclass, SerializableDataclass, serializable_field
-from zanj import ZANJ
 from zanj.torchutil import ConfiguredModel, set_config_class
 
 torch.set_default_dtype(torch.float32)
@@ -29,27 +26,22 @@ class DatasetConfig(SerializableDataclass):
  
 # For MNIST Handwritten Digits
 def to_spiketrain (output, sample, total_timesteps, max_firings, n_timesteps_spike):
-    #print("sample shape", sample.shape)
-    #print("output shape", output.shape)
-    for pix_id, s in enumerate(sample):     
-            # Sample - 28x28 tensor from 0 to 1
-            # Output - Spiketrain representation total_timesteps x (28x28)
-            if s < 0.01:
-                continue # No spikes, pixel is black.
-
-            rate = (max_firings * s) / total_timesteps
-            exp = Exponential(rate)
-            i = 0
-            while i < total_timesteps:
-                period = exp.sample() #Sample from the exponential distribution with rate = rate
-                i += int(period) # Spike at i + period
-                end_pt = min(total_timesteps, i+n_timesteps_spike)
-                #print("i, end_pt, period", i, end_pt, period)
-                output[i:end_pt, pix_id] = 1.0 
-                i = end_pt
+    for pix_id, s in enumerate(sample.flatten()):
+        # Sample - 28x28 tensor from 0 to 1
+        # Output - Spiketrain representation total_timesteps x (28x28)
+        if s < 0.01:
+            continue # No spikes, pixel is black.
             
-
-               # xtestspiketrains [sample, i:end_pt, pix_id] = 1.0 
+        rate = (max_firings * s) / total_timesteps
+        exp = Exponential(rate)
+        i = 0
+        while i < total_timesteps:
+            period = exp.sample() #Sample from the exponential distribution with rate = rate
+            i += int(period) # Spike at i + period
+            end_pt = min(total_timesteps, i+n_timesteps_spike)
+            #print("i, end_pt, period", i, end_pt, period)
+            output[i:end_pt, pix_id] = 1.0 
+            i = end_pt
 
 class SpikeTrainMNIST(Dataset):
     """

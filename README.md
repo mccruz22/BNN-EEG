@@ -6,7 +6,7 @@ Python-based project for Biological Neural Network modeling and analysis for EEG
 
 ## Installation
 
-Copy the project code and data.
+Copy the project code and data (if using EEG data).
 
 
 ## Environtment-Setup

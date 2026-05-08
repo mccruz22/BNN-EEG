@@ -1,5 +1,5 @@
 # Training on BNNs
-from bnbp5.mnist_spiketrain_sliding import MNISTBrain
+from bnbp5.mnist_spiketrain_sliding import *
 from bnbp5.bnn_intralayer import *
 
 from torchvision import datasets, transforms
@@ -8,8 +8,6 @@ from torch import nn
 from sklearn.model_selection import train_test_split
 
 import time
-from datetime import datetime
-import json
 import numpy as np
 import pandas as pd
 import scipy
@@ -17,7 +15,6 @@ import scipy.io
 import h5py
 import matplotlib.pyplot as plt
 import mne
-import math
 
 import os
 from os import listdir

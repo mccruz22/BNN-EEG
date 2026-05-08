@@ -7,14 +7,9 @@ import torch.nn.functional as F
 from torch import nn
 
 import snntorch as snn
-from snntorch import spikeplot as splt
-from snntorch import spikegen
-from torch_geometric.nn import GCNConv
 
-from typing import Type
 from jaxtyping import Float
 from muutils.json_serialize import serializable_dataclass, SerializableDataclass, serializable_field
-from zanj import ZANJ
 from zanj.torchutil import ConfiguredModel, set_config_class
 
 torch.set_default_dtype(torch.float32)
@@ -46,14 +41,7 @@ _HH_PARAMS: dict[str, float] = {
     "Kp": 8.0,
     "a_d": 1.0,
     "a_r": 0.1,
-
-     # 'gna': [56.0, float], #model of RS fig 2, units MS, mV, cm^2
-    # 'gk': [6.0, float],
-    # 'gl': [0.0205, float],
-        
-     # 'Ena': [50.0, float],
-     # 'Ek': [-90.0, float],
-     # 'El': [-70.3, float],        
+ 
 }   
 
 # Parameters for Synapse
@@ -83,13 +71,8 @@ class BNNConfig(SerializableDataclass):
     batchnorm: bool = serializable_field(default=False)
     DNN: bool = serializable_field(default=False)
     DNN_ReLU: bool = serializable_field(default=False)
-    edge_weight: list[float] = serializable_field(default_factory=lambda: [1, 1, 1])
-    edge_weight_unflattened: list[float] = serializable_field(default_factory=lambda: [1, 1, 1])
-    conn: str = serializable_field(default="")
-    drop_fraction: float = serializable_field(default=0.0)
     file_name: str = serializable_field(default="")
-    transfer_learning: bool = serializable_field(default=False)
-
+    
     neuron_params: dict[str, float] = serializable_field(
         default_factory = lambda: _HH_PARAMS,
     )
@@ -220,8 +203,6 @@ class model_HH_RS(nn.Module):
         self.z_weight = cfg.z_weight
         self.network_type = cfg.network_type
         self.plot_interm = cfg.plot_interm
-        self.conn = cfg.conn
-        self.drop_fraction = cfg.drop_fraction
         self.file_name = cfg.file_name        
         
         # intralayer connections with random initial synaptic weights
@@ -229,43 +210,6 @@ class model_HH_RS(nn.Module):
             torch.manual_seed(15)
             self.syn_weights = nn.Parameter(torch.randn(dim, dim))
             self.P_syn = cfg.synapse_params
-            
-        # intralayer connections with weights informed by distances    
-        elif self.network_type == 2:            
-            torch.manual_seed(15)
-            self.syn_weights = nn.Parameter(torch.randn(dim, dim))
-            self.P_syn = cfg.synapse_params
-            
-            self.edge_weight = cfg.edge_weight_unflattened[:dim,:dim] # informed by distances
-            # 0-100% of random connections set to 0
-            if self.conn == "random":
-                # generate random mask with 1s and 0s, self.drop_fraction% of entries set to 0
-                mask = (torch.rand_like(self.edge_weight) > self.drop_fraction).float()
-
-                # apply mask
-                self.edge_weight  = self.edge_weight * mask
-                self.syn_weights.data = self.syn_weights.data * mask
-              
-            # local connectivity
-            if self.conn == "local_neighbor":
-                rows, cols = self.edge_weight.shape
-
-                # create a tridiagonal mask
-                mask = torch.zeros_like(self.edge_weight)
-                for i in range(rows):
-                    for j in [i-1, i, i+1]:
-                        if 0 <= j < cols:
-                            mask[i, j] = 1.0
-               
-                # apply mask
-                self.edge_weight  = self.edge_weight * mask
-                self.syn_weights.data = self.syn_weights.data * mask
-                
-            # edge labels    
-            edges = [(i, j) for i in range(dim) for j in range(dim) if i!=j]  # upper triangular part of the matrix
-            self.edge_index = torch.tensor(edges, dtype=torch.long).T  # transpose to get shape (2, num_edges)
-       
-    
     
     def forward(self, z: Float[torch.Tensor, "B T self.dim"]) -> Float[torch.Tensor, "B T self.dim"]:
         # batch size, num timesteps
@@ -314,31 +258,6 @@ class model_HH_RS(nn.Module):
             G_scaled = (dt / 2) * (pow1 + pow2 + gl + powm)
             E = pow1 * Ena + pow2 * Ek + gl * El + powm * Ek
             
-            '''
-               # non-vectorized version of spikes
-               for neuron in range(V.shape[2]):
-                    for trial in range(V.shape[0]):
-                        # Check if membrane potential exceeds threshold and not in refractory period
-                        #print(k,V[trial, k-1, neuron])
-                        if V[trial, k-1, neuron] >= threshold:
-                            #print("eyy")
-                            # Check for refractory period
-                            if (k -1 - spike_times[trial, neuron]) > refractory_period:
-                                #if trial == 0:
-                                #    print("eyye2", k-1, spike_times[trial, neuron], neuron)
-                                spike_times[trial, neuron]= k-1
-                        if spike_times[trial, neuron] > 0:
-                            spikes_windowed[trial, neuron] = torch.exp(-(k-spike_times[trial, neuron].clone()/taus))  
-
-               window = 50  # ms or time steps
-                STE = []
-
-                for spike_time in np.where(spike_times)[0]:
-                    if spike_time > window:
-                        STE.append(X[spike_time - window:spike_time])  # Get stimulus before spike
-           '''  
-            
-            
             if self.network_type == 1:
                 # vectorized version of code above
                 threshold_mask = (V[:, k - 1, :] >= threshold)
@@ -350,44 +269,11 @@ class model_HH_RS(nn.Module):
                 synaptic_activity = torch.matmul(spikes_windowed.to(device), self.syn_weights.to(device)) 
                 
                 V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z_weight*z[:, k-1, :] + synaptic_activity)) / (1 + G_scaled)  
-                
-            elif self.network_type == 2:
-                threshold_mask = (V[:, k - 1, :] >= threshold)
-                refractory_mask = ((k - 1 - spike_times) > refractory_period)
-                valid_spikes_mask = (threshold_mask & refractory_mask)
-                spike_times[valid_spikes_mask] = k - 1
-                spikes_windowed = torch.exp(-(k-spike_times)/taus) * (spike_times > 0)
-
-                synaptic_activity = torch.matmul(spikes_windowed.to(device), self.syn_weights.to(device) * self.edge_weight.to(device)) 
-                
-                V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z_weight*z[:, k-1, :] + synaptic_activity)) / (1 + G_scaled)  
             
             # original BNN, feedforward network
             else:
                 V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z_weight*z[:, k-1, :])) / (1 + G_scaled)
             
-            '''
-            time_window =  10 #100  # Adjust as needed
-            spikes = torch.zeros_like(V)
-            if k < time_window:
-               V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z[:, k-1, :])) / (1 + G_scaled)
-           else: 
-               spikes[V >= threshold] = 1 #worked for 0.000001, 0.001, for 0.1 max is 84
-               spikes_windowed = (torch.exp(-spikes[:, k-time_window:k, :]/0.5)*(spikes[:, k-time_window:k, :]>0)).sum(dim=1)  # Sum spikes over the time window
-               #print("spikes", spikes.shape, spikes_windowed.shape) #20,2000,2; spikes_windowed = 20,2
-               #firing_rates_of_presynaptic_neurons = spikes_windowed.mean(dim=1)  # Compute mean firing rate across trials
-               #print("firing rate", firing_rates_of_presynaptic_neurons)
-
-               synaptic_activity = torch.matmul(spikes_windowed, self.syn_weights.transpose(0, 1)) #(20,2)
-
-               #if torch.sum(synaptic_activity) !=0:
-               #     print("syn",synaptic_activity)
-               #     print("spikes", spikes_windowed)
-
-               #print("shapes", self.syn_weights.shape, synaptic_activity.shape)
-               V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z[:, k-1, :] + synaptic_activity)) / (1 + G_scaled)
-            '''
-                
             aH = 0.25 * torch.exp((-V[:, k, :] - 90) / 12.0)
             bH = 0.25 * torch.exp((V[:, k, :] + 34) / 12.0)
             
@@ -604,65 +490,22 @@ class BNN(ConfiguredModel[BNNConfig]):
         T = batch.float()
                 
         for W, layer in zip(self.Ws, self.layers):
-            # adjusted for transfer learning
-            if self.cfg.transfer_learning:
-                # First linear layer (no nonlinearity)
-                W0 = self.Ws[0]
-                z = W0(T)
-                T = z  # no activation
-                if self.cfg.batchnorm:
-                    print("normalizing", T.shape)
-                    mnormed = nn.BatchNorm1d(T.shape[-1]).to(device)
-                    T = mnormed(T.transpose(2,1).to(device)).transpose(2,1).to(device)
-                    print("normalized", T.shape)
-                
-                if include_intermediates:
-                    intermediates.append((z, T))
-
-                # remaining layers: apply W + activation
-                for i in range(1, len(self.Ws)):
-                    W = self.Ws[i]
-                    layer = self.layers[i - 1]  # shifted due to removed layer[0]
-
-                    print("Tshape", T.shape)
-                    z = W(T)
-                    print("zshape", z.shape)
-                    T = layer(z)
-
-                    if self.cfg.batchnorm:
-                        print("normalizing", T.shape)
-                        mnormed = nn.BatchNorm1d(T.shape[-1]).to(device)
-                        T = mnormed(T.transpose(2,1).to(device)).transpose(2,1).to(device)
-                        print("normalized", T.shape)
-
-                    if include_intermediates:
-                        intermediates.append((z, T))
-
-                if include_intermediates:
-                    return T, intermediates
-                else:
-                    return T
-                
             # normal BNN
-            else:
-                print("T shape",T.shape)
-                z = W(T)
-                print("z shape",z.shape)
-                T = layer(z)
+            print("T shape",T.shape)
+            z = W(T)
+            print("z shape",z.shape)
+            T = layer(z)
 
-                #print("Wweight", W.weight)
-                #print("layersweight", layer.weight)
+            # normalized per layer
+            if self.cfg.batchnorm:
+                print("normalizing", T.shape)
+                mnormed = nn.BatchNorm1d(T.shape[-1]).to(device)
+                T=mnormed(T.transpose(2,1).to(device)).transpose(2,1).to(device)
+                print("normalized", T.shape)
 
-                # normalized per layer
-                if self.cfg.batchnorm:
-                    print("normalizing", T.shape)
-                    mnormed = nn.BatchNorm1d(T.shape[-1]).to(device)
-                    T=mnormed(T.transpose(2,1).to(device)).transpose(2,1).to(device)
-                    print("normalized", T.shape)
-
-                # include z in outputs
-                if include_intermediates:
-                    intermediates.append((z, T))
+            # include z in outputs
+            if include_intermediates:
+                intermediates.append((z, T))
 
         if include_intermediates:
             return T, intermediates
@@ -692,19 +535,7 @@ class LSTMModel(ConfiguredModel[NNSConfig]):
         self.dropout2 = nn.Dropout(self.cfg.bilstm_dropout)  
         self.batch_norm2 = nn.BatchNorm1d(self.cfg.bilstm_model_dims[3])  
         self.output_layer = nn.Linear(self.cfg.bilstm_model_dims[3], self.cfg.bilstm_model_dims[4])  # final output layer (6 classes)
-        
-        '''
-        # define layers
-        self.dense = nn.Linear(128, 32)  
-        self.lstm = nn.LSTM(32, 128, bidirectional=True, batch_first=True)  # biLSTM
-        self.dropout = nn.Dropout(0.3)  
-        self.batch_norm1 = nn.BatchNorm1d(256)  # 128*2 for bidirectional
-        self.dense1 = nn.Linear(256, 64)  
-        self.dropout2 = nn.Dropout(0.3)  
-        self.batch_norm2 = nn.BatchNorm1d(64)  
-        self.output_layer = nn.Linear(64, 6)  # final output layer (6 classes)
-        '''
-        
+          
     def forward(self, x):
         # forward pass through layers
        
@@ -728,125 +559,6 @@ class LSTMModel(ConfiguredModel[NNSConfig]):
         print("final", x.shape)
         return x
     
-class GNN(torch.nn.Module):
-    """
-    model class for Graph Neural Networks (attempt)
-    """    
-    
-    def __init__(self, num_neurons, input_dim, hidden_dim):
-        super(GNN, self).__init__()
-        input_dim = 2201
-        hidden_dim = 128
-        self.feature_projection = torch.nn.Linear(input_dim, hidden_dim)
-        self.feature_projection2 = torch.nn.Linear(hidden_dim, input_dim)
-        self.conv1 = GCNConv(2201, 2201)# input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.output_layer = torch.nn.Linear(hidden_dim, num_neurons)
-        
-        print("dims", input_dim, hidden_dim)
-
-    def forward(self, x, edge_index, edge_weight):
-        print("x shape, edge index, edge weights", x.shape, edge_index, edge_weight)
-        
-        x = self.feature_projection(x.transpose(2,1).to(device).to(device)) # 20, 128, 2201
-        x = self.conv2(x.to(device), edge_index.to(device), edge_weight.to(device)).to(device) #
-        print("XSHAPE", x.shape)
-        x = self.feature_projection2(x.transpose(2,1).to(device).to(device)).transpose(2,1) # 20, 128, 2201
-        print("XSHAPE", x.shape)
-        x = F.relu(x).to(device)
-        x = self.output_layer(x).to(device)
-        print("XSHAPE", x.shape)
-        
-        #plt.figure(figsize=(15,5))
-        #plt.plot(x[0,:,0].detach().cpu().numpy())
-        #plt.show()
-        return x
-    
-    
-@set_config_class(BNNConfig)
-class BNN_GNN(ConfiguredModel[BNNConfig]):
-    """
-    model class for biological neural network with gnns, subclass of ConfiguredModel (attempt)
-    """    
-    
-    @property
-    def cfg(self) -> BNNConfig:
-        return self.zanj_model_config
-    
-    def __init__(self, config: BNNConfig):
-        # storing the model in the zanj_model_config
-        super().__init__(config)
-      
-        self.Ws: torch.nn.ModuleList[nn.Linear] = nn.ModuleList()
-        self.gnns: torch.nn.ModuleList[nn.Module] = nn.ModuleList()
-        self.layers: torch.nn.ModuleList[nn.Module] = nn.ModuleList()
-            
-        num_nodes = 128
-
-        # create edge_index for all pairs of nodes (0 to 127)
-        edges = [(i, j) for i in range(num_nodes) for j in range(num_nodes) if i!=j]  # upper triangular part of the matrix
-        self.edge_index = torch.tensor(edges, dtype=torch.long).T  # transpose to get shape (2, num_edges)
-        self.edge_weight = self.cfg.edge_weight#torch.tensor([0.5, 1.0, 0.8, 1.0], dtype=torch.float)  # weights for the edges
-        
-        '''
-        for d1, d2 in zip(self.cfg.model_dims[:-1], self.cfg.model_dims[1:]):
-            #self.Ws.append(nn.Linear(d1, d2, bias=False))
-            self.gnns.append(GNN(d2, d1, d2))
-            if self.cfg.DNN:
-                self.layers.append(nn.Sigmoid()) 
-            elif self.cfg.DNN_ReLU:
-                self.layers.append(nn.ReLU()) 
-            else:
-                self.layers.append(self.cfg.neuron_model(self.cfg, d2)) # maybe d1? TODO  
-        '''
-        ctr = 0
-        for d1, d2 in zip(self.cfg.model_dims[:-1], self.cfg.model_dims[1:]):
-            if ctr == 0:
-                self.gnns.append(GNN(d2, d1, d2))
-            else:
-                self.Ws.append(nn.Linear(d1, d2, bias=False))
-            ctr +=1 
-            if self.cfg.DNN:
-                self.layers.append(nn.Sigmoid()) 
-            elif self.cfg.DNN_ReLU:
-                self.layers.append(nn.ReLU()) 
-            else:
-                self.layers.append(self.cfg.neuron_model(self.cfg, d2))
-                
-        # need to add weights as parameters of model.
-        for i, W in enumerate(self.Ws):
-            self.__setattr__(f'W{i+1}', W)
-                
-    def forward(
-            self, 
-            batch: torch.Tensor,
-            include_intermediates: bool = False,
-        ) -> torch.Tensor:
-
-        intermediates: list[tuple[torch.Tensor, torch.Tensor]] = []
-        T = batch.float()
-        
-        print("Tshape",T.shape)
-        z = self.gnns[0](T, self.edge_index, self.edge_weight)
-        print("zshape",z.shape)
-        T = self.layers[0](z)
-        
-        if include_intermediates:
-            intermediates.append((z, T))
-            
-        print("Tshape",T.shape)
-        z = self.Ws[0](T)
-        print("zshape",z.shape)
-        T = self.layers[1](z)
-        
-        if include_intermediates:
-            intermediates.append((z, T))
-
-        if include_intermediates:
-            return T, intermediates
-        else:
-            return T
-
 @set_config_class(NNSConfig)
 class SNNNet(ConfiguredModel[NNSConfig]):
     """
