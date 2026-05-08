@@ -50,7 +50,64 @@ def to_spiketrain (output, sample, total_timesteps, max_firings, n_timesteps_spi
             
 
                # xtestspiketrains [sample, i:end_pt, pix_id] = 1.0 
-                    
+
+class SpikeTrainMNIST(Dataset):
+    """
+    Gives the input and labels to neural network (spiketrains and corresponding labels)
+    """
+    
+    # phase should be one of 'test', 'train', 'validation'
+    def __init__(self, mnist_dset, phase, CFG2):
+        offset = 0
+        if phase == 'test':
+            n_samples = CFG2.n_samples_test
+            offset = CFG2.n_samples_val # Split testing data into (validation U testing) disjoint union.
+        elif phase == 'train':
+            offset = CFG2.train_offset
+            n_samples = CFG2.n_samples_train
+        elif phase == 'validation':
+            n_samples = CFG2.n_samples_val
+        else:
+            print(f'ERROR: Invalid phase for MNIST data: {phase}')
+            raise ValueError(phase)
+        print(f'Loading spiketrains for phase: {phase}, n_samples = {n_samples}, offset = {offset}')
+        
+        # If in validation, use first n_samples_val
+        self.spiketrains = torch.zeros((n_samples, CFG2.sim_t, 28*28))
+        self.labels = torch.nn.functional.one_hot(mnist_dset.targets[offset:], num_classes=10) * 1.0
+        fname = '../data/spiketrains'
+        fname += '_' + phase
+        fname += '_' + str(offset)
+        fname += '_' + str(n_samples)
+        fname += '_' + str(CFG2.sim_t)
+        fname += '_' + str(CFG2.poisson_max_firings_per)        
+        fname += '_' + str(CFG2.poisson_n_timesteps_spike)
+        fname += '.pt'
+        
+        print(fname)
+                
+        if exists(fname):
+            self.spiketrains = torch.load(fname)    
+        else:
+            for i in range(n_samples):
+                img = mnist_dset[offset + i]
+                if (i+1) % 500 == 0:
+                    print("%.1f%%" % (100 * i / n_samples))
+                # if i < 10:
+                #     plt.imshow(img[0][0, :, :])
+                #     plt.title(i) 
+                #     print(i, self.labels[i])
+                #     plt.show()
+                to_spiketrain(self.spiketrains[i, :, :], img[0][0, :, :], CFG2.sim_t, CFG2.poisson_max_firings_per, CFG2.poisson_n_timesteps_spike)
+            torch.save(self.spiketrains, fname)
+
+    def __len__(self):
+        return self.spiketrains.shape[0]
+
+    def __getitem__(self, idx):
+
+        
+                           
 class MNISTBrain(Dataset):
     """
     Gives the input and labels to neural network (spiketrains and corresponding labels)
