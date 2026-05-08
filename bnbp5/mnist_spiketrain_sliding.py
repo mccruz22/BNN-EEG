@@ -105,9 +105,12 @@ class SpikeTrainMNIST(Dataset):
         return self.spiketrains.shape[0]
 
     def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+        return self.spiketrains[idx, :, :], self.labels[idx, :]
 
-        
-                           
+
+
 class MNISTBrain(Dataset):
     """
     Gives the input and labels to neural network (spiketrains and corresponding labels)
