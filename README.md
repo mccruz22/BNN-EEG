@@ -43,5 +43,9 @@ Misc: ipykernel
     - change load_anest() depending on dataset
 
 
+## Files in /data Folder
+
+  - pretrained gradients to run HebbianLearning.ipynb
+
 
 
