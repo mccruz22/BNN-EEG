@@ -21,7 +21,6 @@ python -m ipykernel install --user --name=bnn-stages --display-name "Python (bnn
 ## Environtment-Setup Using Pip
 
 ```
-
 py -3.10 -m venv bnn-stages
 bnn-stages\Scripts\activate
 
