@@ -8,13 +8,30 @@ Python-based project for Biological Neural Network modeling and analysis for EEG
 
 Copy the project code and data (if using EEG data). Deidentified data that supports our finding are available from the authors upon reasonable request. Code completely runs with MNIST dataset if you don't have an EEG dataset.
 
-## Environtment-Setup
+## Environtment-Setup Using Conda
 
+```
 conda env create -f environment.yml
 
 conda activate bnn-stages
 
 python -m ipykernel install --user --name=bnn-stages --display-name "Python (bnn)"
+```
+
+## Environtment-Setup Using Pip
+
+```
+
+py -3.10 -m venv bnn-stages
+bnn-stages\Scripts\activate
+
+python -m pip install --upgrade pip
+
+pip install -r requirements.txt
+
+python -m ipykernel install --user --name=bnn-stages --display-name "Python (bnn)"
+
+```
 
 ## Dependencies
 
