@@ -63,5 +63,7 @@ Misc: ipykernel
 
   - pretrained gradients to run HebbianLearning.ipynb
 
+## License
 
+The custom analysis code supporting the findings of this study is openly available in `https://github.com/mccruz22/BNN-EEG`, under MIT License Copyright (c) 2026 Madelyn Cruz license.
 
