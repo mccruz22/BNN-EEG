@@ -437,11 +437,19 @@ class Trainer:
         T2_out, interm_out = self.model(sample.to(device), include_intermediates = True)
         T2_out = T2_out.squeeze() # Shape is [SIM_T, OUTPUT_SIZE].
         window_cnt = int((T2_out.shape[0] - window_size) / stride + 1) 
-        avgs = torch.zeros((window_cnt, T2_out.shape[1]), requires_grad=True).to(device)
         print("window count", window_cnt, T2_out.shape)
-        for i in range(window_cnt):
-            avgs[i, :] = torch.mean(T2_out[i * stride: i * stride+window_size, :], 0)
-        
+        try:
+            avgs = torch.zeros((window_cnt, T2_out.shape[1]), requires_grad=True).to(device)
+            for i in range(window_cnt):
+                avgs[i, :] = torch.mean(T2_out[i * stride: i * stride+window_size, :], 0)
+        except Exception as e:
+            print(f"Error occurred while computing averages: {e}")
+            avgs = torch.stack([
+                T2_out[i * stride : i * stride + window_size, :].mean(0)
+                for i in range(window_cnt)
+            ])
+            avgs.retain_grad()
+
         print("Computing sliding window gradients")       
         
         sliding_grad_1 = torch.zeros(window_cnt, self.CFG1.model_dims[0] * self.CFG1.model_dims[1]).to(device)
