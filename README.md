@@ -46,7 +46,6 @@ Misc: ipykernel
 
 - run_model.ipynb - training; run using Jupyter or can convert to.py
 - Analyze_BNN_Anesthesia.ipynb - accuracies, weights, etc.
-- BNN_*.pth - training files (when trained)
 - HebbianLearning.ipynb - running and visualizing gradients
 
 ## Files in /bnbp5 Folder
@@ -62,6 +61,7 @@ Misc: ipykernel
 ## Files in /data Folder
 
   - pretrained gradients to run HebbianLearning.ipynb
+  - pretrained models to be able to run Analyze_BNN_Anesthesia.ipynb
 
 ## License
 
