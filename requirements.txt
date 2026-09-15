@@ -19,3 +19,4 @@ muutils==0.5.1
 datasets==2.20.0
 albumentations==1.4.11
 typing-extensions==4.10.0
+seaborn==0.13.2

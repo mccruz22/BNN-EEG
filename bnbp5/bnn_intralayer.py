@@ -1,4 +1,9 @@
 ## Biological neural network models.
+
+# Copyright (c) 2026 Madelyn Cruz and Daniel Forger
+# University of Michigan
+# All rights reserved.
+
 import numpy as np
 import matplotlib.pyplot as plt
 

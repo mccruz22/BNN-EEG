@@ -1,4 +1,9 @@
 # Training on BNNs
+
+# Copyright (c) 2026 Madelyn Cruz and Daniel Forger
+# University of Michigan
+# All rights reserved.
+
 from bnbp5.mnist_spiketrain_sliding import *
 from bnbp5.bnn_intralayer import *
 

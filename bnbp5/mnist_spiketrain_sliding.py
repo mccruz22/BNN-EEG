@@ -1,3 +1,9 @@
+## Handling different datasets
+
+# Copyright (c) 2026 Madelyn Cruz and Daniel Forger
+# University of Michigan
+# All rights reserved.
+
 import torch
 from torch.distributions.exponential import Exponential
 from torch.utils.data import Dataset

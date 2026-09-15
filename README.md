@@ -40,7 +40,7 @@ Deep Learning: torch, torchvision, snntorch
 
 Utilities: jaxtyping, zanj, muutils, albumentations, datasets
 
-Misc: ipykernel
+Misc: ipykernel, seaborn
 
 ## Files in BNN-EEG Folder (Codes Folder)
 
