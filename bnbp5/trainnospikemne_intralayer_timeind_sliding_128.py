@@ -1,4 +1,5 @@
-"""BNN training and evaluation.
+"""
+BNN training and evaluation.
 
 Copyright (c) 2026 Madelyn Cruz and Daniel Forger
 University of Michigan. All rights reserved.
@@ -97,10 +98,6 @@ class Trainer:
         return self._optimizer
 
     def set_datasets(self, train_dataset, val_dataset, test_dataset=None):
-        for name, dataset in (
-            ("training", train_dataset),
-            ("validation", val_dataset),
-        ):
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.test_dataset = test_dataset
@@ -321,7 +318,6 @@ class Trainer:
 
         plans = {"train": [], "validation": [], "test": []}
         partitions = []
-        previous_stop = 0
 
         left_margin = gap_samples // 2
         right_margin = gap_samples - left_margin
@@ -332,8 +328,6 @@ class Trainer:
                 continue
 
             stop = start + duration
-            previous_stop = stop
-
             left = start + left_margin
             right = stop - right_margin
 
