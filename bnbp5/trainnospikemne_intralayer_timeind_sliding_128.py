@@ -1,5 +1,4 @@
-"""
-BNN training and evaluation.
+"""BNN training and evaluation.
 
 Copyright (c) 2026 Madelyn Cruz and Daniel Forger
 University of Michigan. All rights reserved.
@@ -16,7 +15,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from zanj import ZANJ
 
-from bnbp5.bnn_intralayer import BNN
+from bnbp5.bnn_intralayer_codex import BNN
 from bnbp5.mnist_spiketrain_sliding import SpikeTrainMNIST
 
 logger = logging.getLogger(__name__)
@@ -35,7 +34,7 @@ class Trainer:
                  data_root=None, eeg_root=None, device=None,
                  train_dataset=None, val_dataset=None, test_dataset=None, download=False, seed=15,
                  num_workers=0, pin_memory=None, grad_clip_norm=1000.0,
-                 validation_fraction=0.3, test_fraction=0.20, epoch_seconds=4.0, gap_seconds=0.0,
+                 validation_fraction=0.3, test_fraction=0.0, epoch_seconds=4.0, gap_seconds=0.0,
                  bandpass=(0.5, 60.0), trusted_checkpoint=True):
         if dataset not in ('mnist', 'anesthesia', 'provided', 'none'):
             raise ValueError("dataset must be mnist, anesthesia, provided, or none")
@@ -102,12 +101,6 @@ class Trainer:
             ("training", train_dataset),
             ("validation", val_dataset),
         ):
-            if dataset is None or len(dataset) == 0:
-                raise ValueError(f"Provide a nonempty {name} dataset.")
-
-        if test_dataset is not None and len(test_dataset) == 0:
-            raise ValueError("The testing dataset must be nonempty.")
-
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
         self.test_dataset = test_dataset
@@ -126,8 +119,6 @@ class Trainer:
             raise ValueError("Only training batches may be shuffled.")
 
         dataset = datasets[phase]
-        if dataset is None or len(dataset) == 0:
-            raise ValueError(f"No nonempty {phase} dataset is configured.")
 
         batch_size = (
             self.CFG1.train_batch_sz
@@ -214,18 +205,10 @@ class Trainer:
         }
         if subject not in subject_rows:
             raise ValueError(f"Unsupported subject: {subject}")
-        if self.num_classes not in (2, 5, 6):
-            raise ValueError("num_classes must be 2, 5, or 6.")
-
+        
         sfreq = 500
-        montage = mne.channels.read_custom_montage(
-            str(root / "EGI_ChannelLocations" / "GSN-HydroCel-128.sfp")
-        )
-
-        event_file = (
-            root
-            / "McDonnell_Events_Info_Summary_TB_10_27_16_DL090817_UManesthesia.xlsx"
-        )
+        montage = mne.channels.read_custom_montage(str(root / "EGI_ChannelLocations" / "GSN-HydroCel-128.sfp"))
+        event_file = (root / "McDonnell_Events_Info_Summary_TB_10_27_16_DL090817_UManesthesia.xlsx")
 
         table = pd.read_excel(event_file, header=0)
         row = subject_rows[subject]
@@ -287,7 +270,6 @@ class Trainer:
         #raw = raw.copy().filter(self.eeg_options.bandpass,verbose=False)
         del eeg
 
-        # Read settings from the revised Trainer when available.
         options = getattr(self, "eeg_options", {}) or {}
         validation_fraction = float(
             options.get("validation_fraction", 0.30)
@@ -302,7 +284,6 @@ class Trainer:
 
         gap_samples = int(round(gap_seconds * sfreq))
 
-        # No bandpass filter: it was commented out in the original.
         tmin = -0.200
         tmax = 4.20
         first_offset = int(round(tmin * sfreq))  # -100
@@ -335,20 +316,6 @@ class Trainer:
         test_fraction = float(options.get("test_fraction", 0.20))
         gap_seconds = float(options.get("gap_seconds", 0.0))
 
-        if (
-            not np.isfinite(validation_fraction)
-            or not np.isfinite(test_fraction)
-            or validation_fraction <= 0
-            or test_fraction <= 0
-            or validation_fraction + test_fraction >= 1
-        ):
-            raise ValueError(
-                "Validation and test fractions must be positive "
-                "and their sum must be less than 1."
-            )
-        if not np.isfinite(gap_seconds) or gap_seconds < 0:
-            raise ValueError("gap_seconds must be finite and nonnegative.")
-
         train_fraction = 1.0 - validation_fraction - test_fraction
         gap_samples = int(round(gap_seconds * sfreq))
 
@@ -365,19 +332,11 @@ class Trainer:
                 continue
 
             stop = start + duration
-            if start < 0 or duration <= 0 or stop > raw.n_times:
-                raise ValueError(
-                    f"Event {event_id} has invalid bounds [{start}, {stop})."
-                )
-            if start < previous_stop:
-                raise ValueError(f"Event {event_id} overlaps another selected event.")
             previous_stop = stop
 
-            # Outer margins separate the end of one event from the next.
             left = start + left_margin
             right = stop - right_margin
 
-            # Reserve two internal gaps: train/validation and validation/test.
             usable = right - left - 2 * gap_samples
             if usable <= 0:
                 raise ValueError(f"Event {event_id} is too short for these gaps.")
@@ -539,9 +498,6 @@ class Trainer:
         Training on one epoch at with evaluation at the end of the epoch and when batches_val is positive.
         Returns accuracies, losses.
         """
-        if not isinstance(batches_val, int) or batches_val == 0 or batches_val < -1:
-            raise ValueError("batches_val must be -1 or a positive integer")
-
         loader = self._loader('train', shuffle=True)
         self.model.train()
         optimizer = self.optimizer
@@ -635,22 +591,14 @@ class Trainer:
         return state
 
     def measure_sliding_gradients(self, window_size, filename, stride=-1, *, include_diagnostics=False):
-        """Measure derivatives without optimizer steps or parameter-gradient mutation.
-
-        Main output keys are compatible with HebbianLearning.ipynb. Expensive
-        per-window dL/d(avgs) matrices are optional, detached CPU snapshots.
+        """
+        Measure derivatives without optimizer steps or parameter-gradient mutation.
         """
         if stride == -1:
             stride = window_size
-        if not isinstance(window_size, int) or window_size <= 0:
-            raise ValueError("window_size must be a positive integer")
-        if not isinstance(stride, int) or stride <= 0:
-            raise ValueError("stride must be a positive integer")
-        if len(self.model.Ws) != 2:
-            raise ValueError("Sliding-gradient export expects two weight layers")
+        
         model_device = next(self.model.parameters()).device
-        if self.train_dataset is None or len(self.train_dataset) == 0:
-            raise ValueError("Gradient measurement requires a nonempty dataset")
+        
         idx = int(torch.randint(0, len(self.train_dataset), (),
                                generator=getattr(self, '_analysis_generator', None)))
         sample, target = self.train_dataset[idx]
