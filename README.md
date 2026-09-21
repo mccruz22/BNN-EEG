@@ -10,6 +10,8 @@ Copy the project code and data (if using EEG data). Deidentified data that suppo
 
 ## Environtment-Setup Using Conda
 
+Run from the directory containing `environment.yml`:
+
 ```
 conda env create -f environment.yml
 
@@ -19,6 +21,9 @@ python -m ipykernel install --user --name=bnn-stages --display-name "Python (bnn
 ```
 
 ## Environtment-Setup Using Pip
+
+Install Python 3.10 if it is not already available. Open Command Prompt
+in the project directory and run:
 
 ```
 py -3.10 -m venv bnn-stages
@@ -48,20 +53,22 @@ Misc: ipykernel, seaborn
 - Analyze_BNN_Anesthesia.ipynb - accuracies, weights, etc.
 - HebbianLearning.ipynb - running and visualizing gradients
 
-## Files in /bnbp5 Folder
+## Model and training modules
 
-##### For Classification
-  - bnn_intralayer.py: all models (same for all codes)
-  - mnist_spike_train_sliding*.py: input adjustments (two versions)
-  - trainnospikemne*.py: dataset and training (same train functions, different load files for different datasets)
-    - self.load_anest() or self.load_mnist() depending on dataset
-    - change load_anest() depending on dataset
+The `bnbp5` directory contains:
+- `bnn_intralayer.py`: neural network and neuron models
+- `mnist_spiketrain_sliding.py`: dataset wrappers and spike-train preparation
+- `trainnospikemne_intralayer_timeind_sliding_128.py`: dataset loading,
+  training, evaluation, checkpoint handling, and gradient measurement
 
+## Data directory
 
-## Files in /data Folder
+`data` or another configured dataset directory contains:
 
-  - pretrained gradients to run HebbianLearning.ipynb
-  - pretrained models to be able to run Analyze_BNN_Anesthesia.ipynb
+- MNIST files and generated spike caches
+- Anesthesia recordings and the event spreadsheet
+- pretrained gradients to run HebbianLearning.ipynb
+- pretrained models to be able to run Analyze_BNN_Anesthesia.ipynb
 
 ## License
 
