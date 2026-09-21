@@ -1,13 +1,15 @@
-## Handling different datasets
+"""
+Handling different datasets.
 
-# Copyright (c) 2026 Madelyn Cruz and Daniel Forger
-# University of Michigan
-# All rights reserved.
+Copyright (c) 2026 Madelyn Cruz and Daniel Forger
+University of Michigan. All rights reserved.
+"""
 
 import torch
 from torch.distributions.exponential import Exponential
 from torch.utils.data import Dataset
 from os.path import exists
+from pathlib import Path
 import matplotlib.pyplot as plt
 
 from torch import nn
@@ -55,7 +57,7 @@ class SpikeTrainMNIST(Dataset):
     """
     
     # phase should be one of 'test', 'train', 'validation'
-    def __init__(self, mnist_dset, phase, CFG2):
+    def __init__(self, mnist_dset, phase, CFG2, *, cache_dir=None, cache_seed=None):
         offset = 0
         if phase == 'test':
             n_samples = CFG2.n_samples_test
@@ -71,22 +73,29 @@ class SpikeTrainMNIST(Dataset):
         print(f'Loading spiketrains for phase: {phase}, n_samples = {n_samples}, offset = {offset}')
         
         # If in validation, use first n_samples_val
-        self.spiketrains = torch.zeros((n_samples, CFG2.sim_t, 28*28))
-        self.labels = torch.nn.functional.one_hot(mnist_dset.targets[offset:], num_classes=10) * 1.0
-        fname = '../data/spiketrains'
+        if offset < 0 or n_samples <= 0 or offset + n_samples > len(mnist_dset):
+            raise ValueError("Requested MNIST subset is outside the dataset")
+        self.labels = torch.nn.functional.one_hot(
+            mnist_dset.targets[offset:offset + n_samples], num_classes=10
+        ).float()
+        fname = str(Path(cache_dir) / 'spiketrains') if cache_dir is not None else '../data/spiketrains'
         fname += '_' + phase
         fname += '_' + str(offset)
         fname += '_' + str(n_samples)
         fname += '_' + str(CFG2.sim_t)
         fname += '_' + str(CFG2.poisson_max_firings_per)        
         fname += '_' + str(CFG2.poisson_n_timesteps_spike)
+        if cache_seed is not None:
+            fname += '_seed' + str(cache_seed)
         fname += '.pt'
         
         print(fname)
                 
         if exists(fname):
-            self.spiketrains = torch.load(fname)    
+            # Load directly: do not first allocate a second, multi-GB tensor.
+            self.spiketrains = torch.load(fname, map_location="cpu", weights_only=True)
         else:
+            self.spiketrains = torch.zeros((n_samples, CFG2.sim_t, 28*28), dtype=torch.bool)
             for i in range(n_samples):
                 img = mnist_dset[offset + i]
                 if (i+1) % 500 == 0:
@@ -97,6 +106,7 @@ class SpikeTrainMNIST(Dataset):
                 #     print(i, self.labels[i])
                 #     plt.show()
                 to_spiketrain(self.spiketrains[i, :, :], img[0][0, :, :], CFG2.sim_t, CFG2.poisson_max_firings_per, CFG2.poisson_n_timesteps_spike)
+            Path(fname).parent.mkdir(parents=True, exist_ok=True)
             torch.save(self.spiketrains, fname)
 
     def __len__(self):
@@ -108,56 +118,3 @@ class SpikeTrainMNIST(Dataset):
         return self.spiketrains[idx, :, :], self.labels[idx, :]
 
 
-
-class MNISTBrain(Dataset):
-    """
-    Gives the input and labels to neural network (spiketrains and corresponding labels)
-    """
-    
-    # phase should be one of 'test', 'train', 'validation'
-    def __init__(self, inputdata, labels, phase, CFG2, repeat = False):        
-        offset = 0
-        if phase == 'test':
-            n_samples = CFG2.n_samples_test
-            offset = CFG2.n_samples_val # Split testing data into (validation U testing) disjoint union.
-        elif phase == 'train':
-            offset = CFG2.train_offset
-            n_samples = CFG2.n_samples_train
-        elif phase == 'validation':
-            n_samples = CFG2.n_samples_val
-        else:
-            print(f'ERROR: Invalid phase for MNIST data: {phase}')
-            raise ValueError(phase)
-        print(f'Loading spiketrains for phase: {phase}, n_samples = {n_samples}, offset = {offset}')
-        
-        if repeat == False:
-            self.spiketrains = inputdata[:n_samples,:,:]
-            print("spiketrains", self.spiketrains.shape)
-
-        else:
-            # reshaping to adjust for time
-            le = 10#100#400#300#200
-            self.spiketrains = inputdata[:n_samples, 0:le, :]
-            tdt = 10
-            for i in range (1, (500-le)//tdt):
-                self.spiketrains = torch.cat((self.spiketrains, inputdata[:n_samples, tdt*i:tdt*i+le, :]), dim=-1)
-            self.spiketrains =  self.spiketrains.repeat(1,2000//le,1)
-           
-        
-        print("labelsshape", labels.shape)
-        self.labels = labels[:n_samples,:] 
-        print("labelsshape", self.labels.shape)
-        
-        print("labels", torch.sum(self.labels, axis=0))
-        
-
-    def __len__(self):
-        return self.spiketrains.shape[0]
-
-    def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-        return self.spiketrains[idx, :, :], self.labels[idx, :]
-    
-    
-    

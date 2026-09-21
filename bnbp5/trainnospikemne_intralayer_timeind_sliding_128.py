@@ -1,506 +1,694 @@
-# Training on BNNs
+"""
+BNN training and evaluation.
 
-# Copyright (c) 2026 Madelyn Cruz and Daniel Forger
-# University of Michigan
-# All rights reserved.
+Copyright (c) 2026 Madelyn Cruz and Daniel Forger
+University of Michigan. All rights reserved.
+"""
+from collections.abc import Mapping
+import logging
+from pathlib import Path
+import random
+import time
 
-from bnbp5.mnist_spiketrain_sliding import *
-from bnbp5.bnn_intralayer import *
-
-from torchvision import datasets, transforms
+import numpy as np
 import torch
 from torch import nn
-from sklearn.model_selection import train_test_split
-
-import time
-import numpy as np
-import pandas as pd
-import scipy
-import scipy.io
-import h5py
-import matplotlib.pyplot as plt
-import mne
-
-import os
-from os import listdir
-from os.path import exists
-import glob
-
+from torch.utils.data import DataLoader, TensorDataset
 from zanj import ZANJ
 
-torch.set_default_dtype(torch.float32)
+from bnbp5.bnn_intralayer import BNN
+from bnbp5.mnist_spiketrain_sliding import SpikeTrainMNIST
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger = logging.getLogger(__name__)
 
-base_folder = '/nfs/turbo/lsa-forger/mccruz/Anesthesia'
+def _seed_worker(_worker_id):
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
 
 class Trainer:
     """
-    Training and Validating, and Measuring sliding gradients for a single sample
+    BNN/DNN trainer with explicit dataset selection. 
     """
-    
-    def __init__(self, CFG1, CFG2, save=True, pretrained='', 
-                 subjects=["UM_7"], 
-                 ctrs1=[0], ctrs2=[5], num_classes=2):
-            
-        # Creating model from the config
-        self.model = BNN(CFG1).to(device)
+    def __init__(self, CFG1, CFG2, pretrained='', subjects=None,
+                 ctrs1=None, ctrs2=None, num_classes=2, *, dataset='mnist',
+                 data_root=None, eeg_root=None, device=None,
+                 train_dataset=None, val_dataset=None, test_dataset=None, download=False, seed=15,
+                 num_workers=0, pin_memory=None, grad_clip_norm=1000.0,
+                 validation_fraction=0.3, test_fraction=0.20, epoch_seconds=4.0, gap_seconds=0.0,
+                 bandpass=(0.5, 60.0), trusted_checkpoint=True):
+        if dataset not in ('mnist', 'anesthesia', 'provided', 'none'):
+            raise ValueError("dataset must be mnist, anesthesia, provided, or none")
         
-        self.CFG1 = CFG1
-        self.CFG2 = CFG2
+        if not isinstance(num_workers, int) or num_workers < 0:
+            raise ValueError("num_workers must be a nonnegative integer")
         
-        self.subjects=subjects
-        self.ctrs1 = ctrs1
-        self.ctrs2 = ctrs2
-        self.num_classes = num_classes
-        if pretrained != '':
-            self.load_model_from_file(pretrained)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr = CFG1.lr)
-
-        print("Model parameters:")
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                print(name)
-            
-        #self.load_anest() # Loading Dataset
-        self.load_mnist()
+        if (train_dataset is not None or val_dataset is not None) and dataset != 'provided':
+            raise ValueError("Use dataset='provided' when passing datasets")
         
-    def load_mnist(self):
-        transform=transforms.Compose([
-            transforms.ToTensor()
-        ])
-        train_mnist = datasets.MNIST(
-            '../data/mnist_torch/',
-            train=True, download=True, transform=transform,
+        self.CFG1, self.CFG2 = CFG1, CFG2
+        self.subjects = list(['UM_7'] if subjects is None else subjects)
+        self.ctrs1 = None if ctrs1 is None else list(ctrs1)
+        self.ctrs2 = None if ctrs2 is None else list(ctrs2)
+        self.num_classes, self.seed = num_classes, int(seed)
+        
+        self.dataset_name = dataset
+        self.data_root = Path(data_root) if data_root is not None else Path(__file__).resolve().parents[1] / 'data'
+        self.eeg_root = None if eeg_root is None else Path(eeg_root)
+        self.eeg_options = dict(
+            validation_fraction=validation_fraction,
+            test_fraction=test_fraction,
+            epoch_seconds=epoch_seconds,
+            gap_seconds=gap_seconds,
+            bandpass=bandpass,
         )
-        test_mnist = datasets.MNIST(
-            '../data/mnist_torch/',
-            train=False, download=True, transform=transform,
+
+        target_device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+
+        self.model = BNN(CFG1).to(target_device)
+        self.num_workers = num_workers
+        self.pin_memory = target_device.type == 'cuda' if pin_memory is None else bool(pin_memory)
+        self.grad_clip_norm = float(grad_clip_norm)
+        self._loader_cache = {}
+        self._shuffle_generator = torch.Generator().manual_seed(self.seed)
+        self._analysis_generator = torch.Generator().manual_seed(self.seed + 2)
+        self._optimizer = None
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+        self.last_epoch = None
+
+        if pretrained:
+            self.load_model_from_file(pretrained, trusted_checkpoint=trusted_checkpoint)
+        if dataset == "provided":
+            self.set_datasets(train_dataset, val_dataset, test_dataset)
+        elif dataset == "mnist":
+            self.load_mnist(download=download)
+        elif dataset == "anesthesia":
+            self.load_anest()
+
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
+    @property
+    def optimizer(self):
+        if self._optimizer is None:
+            self._optimizer = torch.optim.Adam(self.model.parameters(), lr=self.CFG1.lr)
+        return self._optimizer
+
+    def set_datasets(self, train_dataset, val_dataset, test_dataset=None):
+        for name, dataset in (
+            ("training", train_dataset),
+            ("validation", val_dataset),
+        ):
+            if dataset is None or len(dataset) == 0:
+                raise ValueError(f"Provide a nonempty {name} dataset.")
+
+        if test_dataset is not None and len(test_dataset) == 0:
+            raise ValueError("The testing dataset must be nonempty.")
+
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+        self._loader_cache = {}
+
+
+    def _loader(self, phase, *, shuffle=False):
+        datasets = {
+            "train": self.train_dataset,
+            "validation": self.val_dataset,
+            "test": self.test_dataset,
+        }
+        if phase not in datasets:
+            raise ValueError(f"Unknown dataset phase: {phase}")
+        if shuffle and phase != "train":
+            raise ValueError("Only training batches may be shuffled.")
+
+        dataset = datasets[phase]
+        if dataset is None or len(dataset) == 0:
+            raise ValueError(f"No nonempty {phase} dataset is configured.")
+
+        batch_size = (
+            self.CFG1.train_batch_sz
+            if shuffle else self.CFG1.test_batch_sz
         )
-        self.train_dataset = None # Deallocate        
-        self.val_dataset = None # Deallocate
-        self.train_dataset = SpikeTrainMNIST(train_mnist, 'train', self.CFG2)
-        self.val_dataset = SpikeTrainMNIST(test_mnist, 'validation', self.CFG2) # or test after validation
+        if batch_size < 1:
+            raise ValueError("Batch sizes must be positive.")
 
-    def load_anest(self): 
-        ## Loading and Preprocessing Dataset (Anesthesia Dataset), Replace with other dataset
-        
-        # .sfp file
-        file_path = base_folder + '/EGI_ChannelLocations/GSN-HydroCel-128.sfp'
+        workers = self.num_workers
+        pin = self.pin_memory
+        key = (id(dataset), batch_size, shuffle, workers, pin)
+        slot = (phase, shuffle)
 
-        # Load the montage
-        montage = mne.channels.read_custom_montage(file_path)
-
-        # Print montage information
-        #print(montage)
-
-        df = pd.read_excel(base_folder + '/McDonnell_Events_Info_Summary_TB_10_27_16_DL090817_UManesthesia.xlsx')#, header=True)
-
-        if "UM_4" in self.subjects:
-            i=2            
-            max_num_epochs = 10000000
-        elif "UM_7" in self.subjects:
-            i=3            
-            max_num_epochs = 10000000
-        elif "UM_8" in self.subjects:
-            i=4
-            max_num_epochs = 10000
-        elif "UM_12" in self.subjects:
-            i=6
-            max_num_epochs = 10000
-        elif "UM_13" in self.subjects:
-            i=7
-            max_num_epochs = 8000            
-        elif "UM_9" in self.subjects:
-            i=5
-            max_num_epochs = 30
-        elif "UM_14" in self.subjects:
-            i=8
-            max_num_epochs = 30
-        elif "UM_18" in self.subjects:
-            i=9
-            max_num_epochs = 30
-        elif "UM_21" in self.subjects:
-            i=10
-            max_num_epochs = 30
-        sfreq = 500
-
-        onsets = []
-        durations = []
-        event_ids = []
-
-        for j in [1, 3, 5]:
-            onsets.append(df.loc[i,j])
-            durations.append(df.loc[i,j+1]-df.loc[i,j])
-            event_ids.append(df.loc[0,j][:-1])
-
-
-        onsets.extend([df.loc[i, 7], df.loc[i, 11], df.loc[i, 12], df.loc[i, 13],  df.loc[i, 15]])
-        durations.extend([df.loc[i, 11] - df.loc[i, 7], df.loc[i, 12]-df.loc[i, 11],df.loc[i, 13]-df.loc[i, 12],df.loc[i, 15]-df.loc[i, 13],df.loc[i, 16]-df.loc[i, 15]])
-        event_ids.extend([df.loc[0, 7],df.loc[0, 11], df.loc[0, 12], df.loc[0, 13], df.loc[0, 15]])
-
-        for j in [16, 20, 22, 26, 28, 32, 34, 38, 40, 44, 46, 50, 52]:
-            onsets.append(df.loc[i,j])
-            durations.append(df.loc[i,j+1]-df.loc[i,j])
-            event_ids.append(df.loc[0,j][:-1])
-
-        onsets = np.array(onsets)
-        durations = np.array(durations)
-        event_ids_text = event_ids
-        event_ids = np.arange(len(event_ids)).astype(int)
-
-        onsets_in_samples = (onsets).astype(int)  # Convert from seconds to sample index
-        durations_in_samples = (durations ).astype(int)  # Convert from seconds to sample index
-        events = np.column_stack((onsets_in_samples, durations_in_samples , event_ids))
-
-        # Define the folder path
-        folder_path = base_folder + '/' + self.subjects[0]
-        if "UM_7" in self.subjects:
-            folder_path = base_folder + '/UM_7'
-        elif "UM_8" in self.subjects:
-            folder_path = base_folder + '/UM_8'
-        elif "UM_12" in self.subjects:
-            folder_path = base_folder + '/UM_12'
-        elif "UM_13" in self.subjects:
-            folder_path = base_folder + '/UM_13'
-        elif "UM_4" in self.subjects:
-            folder_path = base_folder + '/UM_4'
-        
-        # Get all .mat files in the folder
-        mat_files = glob.glob(os.path.join(folder_path, '*.mat'))
-
-        # Print the list of .mat files
-        print(sorted(mat_files))
-        eeg_data_list = []
-
-        for file_path in sorted(mat_files):  # file_path = 'UM_12/MDFA10 20140419 0854.mat'
-            print(file_path)
-            try:
-                # Load the .mat file using scipy
-                mat_data = scipy.io.loadmat(file_path)
-
-                # Inspect the keys to find the EEG data
-                print(mat_data.keys())
-
-                # Assuming 'eeg_data' contains the EEG data in shape (n_channels, n_times)
-                eeg_data = mat_data['EEG'][0, 0][15]  # Replace with the actual key name
-
-                # Append the EEG data to the list
-                eeg_data_list.append(eeg_data)
-
-            except NotImplementedError:
-                with h5py.File(file_path, 'r') as f:
-                    eeg_group = f['EEG']
-                    print("Keys in 'EEG' group:", list(eeg_group.keys()))
-
-                    # Assuming 'data' contains the EEG data
-                    eeg_data = eeg_group['data'][:]  # Replace 'data' with the actual dataset name
-
-                    # Append the transposed EEG data to the list
-                    eeg_data_list.append(eeg_data[:,:128].T)
-
-        try:
-            # Concatenate all EEG data along the first axis
-            eeg_data_all = np.concatenate(eeg_data_list, axis=1)
-        except ValueError:
-            eeg_data_all = np.array(eeg_data_list)
-        
-        # Print the final shape of the combined EEG data
-        print("Combined EEG data shape:", eeg_data_all.shape)
-
-        info = mne.create_info(ch_names=montage.ch_names, sfreq=500, ch_types='eeg')
-
-        # Apply the montage to the info object
-        info.set_montage(montage)
-
-        # Plot the montage
-        mne.viz.plot_montage(montage, show=True);
-
-        info = mne.create_info(ch_names=info['ch_names'], sfreq=info['sfreq'], ch_types='eeg')
-        raw = mne.io.RawArray(eeg_data_all, info)#[0,0][15]
-        #raw = raw.copy().filter(2,60,verbose=False) #tried before and after filter
-        raw.set_montage(montage);
-       
-        del eeg_data_list, eeg_data, info, mat_files
-        
-        new_events = []
-
-        for i in range (len(events)):
-            print(events[i][0], events[i][1], events[i][2])
-            
-            start = events[i][0]
-            duration = events[i][1]
-            label = events[i][2]
-
-            if self.num_classes == 2:
-                if label <=4:   
-                    while duration > 500:                                
-                        new_events.append([start, 0, label])
-                        start = start + 500
-                        duration = duration - 500
-                        
+        if slot not in self._loader_cache or self._loader_cache[slot][0] != key:
+            # Evaluation never advances the training-shuffle generator.
+            if shuffle:
+                generator = self._shuffle_generator
             else:
-                while duration > 2000:                                
-                    new_events.append([start, 0, label])
-                    start = start + 2000
-                    duration = duration - 2000
+                seed_offset = {"train": 1, "validation": 2, "test": 3}[phase]
+                generator = torch.Generator().manual_seed(
+                    self.seed + seed_offset
+                )
 
-        epochs = mne.Epochs(raw, new_events,tmin=-0.200, tmax=4.20, baseline=None, preload=True)        
-  
-        epochs.pick_types(eeg=True)
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=workers,
+                pin_memory=pin,
+                persistent_workers=workers > 0,
+                worker_init_fn=_seed_worker,
+                generator=generator,
+            )
+            self._loader_cache[slot] = (key, loader)
 
-        X = epochs.get_data()
-        y = torch.tensor(epochs.events[:,-1], dtype=torch.float32)
+        return self._loader_cache[slot][1]
 
-        del raw, epochs, eeg_data_all #, all_epochs_list, epochs_list
+    def load_mnist(self, *, download=False):
+        from torchvision import datasets, transforms
+        if self.CFG1.model_dims[0] != 784 or self.CFG1.model_dims[-1] != 10:
+            raise ValueError("MNIST requires 784 input features and 10 output classes")
+        raw_root = self.data_root / 'mnist_torch'
+        prepared = []
+        for train, phase, phase_seed in [(True, 'train', self.seed), (False, 'validation', self.seed + 1)]:
+            raw = datasets.MNIST(str(raw_root), train=train, download=download, transform=transforms.ToTensor())
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(phase_seed)
+                prepared.append(SpikeTrainMNIST(raw, phase, self.CFG2,
+                                               cache_dir=self.data_root, cache_seed=phase_seed))
+        self.set_datasets(*prepared)
+
+    def load_anest(self):
+        """
+        Load anesthesia data.
+        """
+        from pathlib import Path
+
+        import h5py
+        import mne
+        import pandas as pd
+        import scipy.io
+        from torch.utils.data import TensorDataset
+
+        root = getattr(self, "eeg_root", None)
+        if root is None:
+            raise ValueError("Set eeg_root to the anesthesia dataset folder.")
+        root = Path(root)
+
+        subjects = list(self.subjects)
+        if len(subjects) != 1:
+            raise ValueError("Specify exactly one anesthesia subject.")
+
+        subject = subjects[0]
+        subject_rows = {
+            "UM_4": 2,
+            "UM_7": 3,
+            "UM_8": 4,
+            "UM_9": 5,
+            "UM_12": 6,
+            "UM_13": 7,
+            "UM_14": 8,
+            "UM_18": 9,
+            "UM_21": 10,
+        }
+        if subject not in subject_rows:
+            raise ValueError(f"Unsupported subject: {subject}")
+        if self.num_classes not in (2, 5, 6):
+            raise ValueError("num_classes must be 2, 5, or 6.")
+
+        sfreq = 500
+        montage = mne.channels.read_custom_montage(
+            str(root / "EGI_ChannelLocations" / "GSN-HydroCel-128.sfp")
+        )
+
+        event_file = (
+            root
+            / "McDonnell_Events_Info_Summary_TB_10_27_16_DL090817_UManesthesia.xlsx"
+        )
+
+        table = pd.read_excel(event_file, header=0)
+        row = subject_rows[subject]
+
+        pairs = [(1, 2), (3, 4), (5, 6)]
+        pairs += [(7, 11), (11, 12), (12, 13), (13, 15), (15, 16)]
+        pairs += [
+            (j, j + 1)
+            for j in (16, 20, 22, 26, 28, 32, 34, 38, 40, 44, 46, 50, 52)
+        ]
+
+        events = []
+        for event_id, (start_column, stop_column) in enumerate(pairs):
+            onset = float(table.loc[row, start_column])
+            duration = float(
+                table.loc[row, stop_column] - table.loc[row, start_column]
+            )
+            if not np.isfinite(onset) or not np.isfinite(duration):
+                raise ValueError(f"Nonfinite timing for event {event_id}.")
+
+            events.append((int(onset), int(duration), event_id))
+
+        mat_files = sorted((root / subject).glob("*.mat"))
+        if not mat_files:
+            raise FileNotFoundError(f"No MAT files found in {root / subject}")
+
+        chunks = []
+        for path in mat_files:
+            try:
+                mat_data = scipy.io.loadmat(str(path))
+                chunk = mat_data["EEG"][0, 0][15]
+            except NotImplementedError:
+                with h5py.File(path, "r") as handle:
+                    chunk = handle["EEG"]["data"][:, :128].T
+
+            chunk = np.asarray(chunk)
+            if chunk.ndim != 2:
+                raise ValueError(
+                    f"{path.name}: expected [channels, samples], got {chunk.shape}"
+                )
+            if chunk.shape[0] != len(montage.ch_names):
+                raise ValueError(
+                    f"{path.name}: found {chunk.shape[0]} channels, "
+                    f"but montage has {len(montage.ch_names)}."
+                )
+            chunks.append(chunk)
+
+        # Preserve channel order and concatenate recordings along time.
+        eeg = np.concatenate(chunks, axis=1)
+        del chunks
+
+        info = mne.create_info(
+            ch_names=montage.ch_names,
+            sfreq=sfreq,
+            ch_types="eeg",
+        )
+        raw = mne.io.RawArray(eeg, info, verbose=False)
+        raw.set_montage(montage)
+        #raw = raw.copy().filter(self.eeg_options.bandpass,verbose=False)
+        del eeg
+
+        # Read settings from the revised Trainer when available.
+        options = getattr(self, "eeg_options", {}) or {}
+        validation_fraction = float(
+            options.get("validation_fraction", 0.30)
+        )
+        gap_seconds = float(options.get("gap_seconds", 4.0))
+
+        if not np.isfinite(validation_fraction) or not 0 < validation_fraction < 1:
+            raise ValueError("validation_fraction must be between 0 and 1.")
+
+        if not np.isfinite(gap_seconds) or gap_seconds < 0:
+            raise ValueError("gap_seconds must be finite and nonnegative.")
+
+        gap_samples = int(round(gap_seconds * sfreq))
+
+        # No bandpass filter: it was commented out in the original.
+        tmin = -0.200
+        tmax = 4.20
+        first_offset = int(round(tmin * sfreq))  # -100
+        last_offset = int(round(tmax * sfreq))  # 2100
+        epoch_samples = last_offset - first_offset + 1  # 2201
         
-        # Assigining classes
-        if self.num_classes == 6:
-            print("6")
-            y[y<=2] = 0
-            y[y==3] = 1
-            y[y==4] = 2
-            y[(y==5) | (y==6)] = 3
-            y[y==7] = 4
-            y[y>=8] = 5
-            
-            # Find indices of 0s and 1s
-            indices_0 = np.where(y == 0)[0]
-            indices_1 = np.where(y == 1)[0]
-            indices_2 = np.where(y == 2)[0]
-            indices_3 = np.where(y == 3)[0]
-            indices_4 = np.where(y == 4)[0]
-            indices_5 = np.where(y == 5)[0]
+        def map_label(event_id):
+            """Preserve the original class definitions."""
+            if self.num_classes == 2:
+                if event_id <= 2:
+                    return 0
+                if event_id == 4:
+                    return 1
+                return None
 
-            # Find the minimum count between the two
-            min_count = min(len(indices_0), len(indices_1), len(indices_2), len(indices_3), len(indices_4), len(indices_5))
+            if event_id <= 2:
+                return 0
+            if event_id == 3:
+                return 1
+            if event_id == 4:
+                return 2
+            if event_id in (5, 6):
+                return 3
+            if event_id == 7:
+                return 4
+            return 5 if self.num_classes == 6 else None
 
-            # Randomly sample min_count from both 0 and 1 indices
-            selected_0 = np.random.choice(indices_0, min_count, replace=False)
-            selected_1 = np.random.choice(indices_1, min_count, replace=False)
-            selected_2 = np.random.choice(indices_2, min_count, replace=False)
-            selected_3 = np.random.choice(indices_3, min_count, replace=False)
-            selected_4 = np.random.choice(indices_4, min_count, replace=False)
-            selected_5 = np.random.choice(indices_5, min_count, replace=False)
+        options = getattr(self, "eeg_options", {}) or {}
+        validation_fraction = float(options.get("validation_fraction", 0.30))
+        test_fraction = float(options.get("test_fraction", 0.20))
+        gap_seconds = float(options.get("gap_seconds", 0.0))
 
-            # Combine the selected indices and shuffle them
-            selected_indices = np.concatenate([selected_0, selected_1, selected_2, selected_3, selected_4, selected_5])
-            np.random.shuffle(selected_indices)
+        if (
+            not np.isfinite(validation_fraction)
+            or not np.isfinite(test_fraction)
+            or validation_fraction <= 0
+            or test_fraction <= 0
+            or validation_fraction + test_fraction >= 1
+        ):
+            raise ValueError(
+                "Validation and test fractions must be positive "
+                "and their sum must be less than 1."
+            )
+        if not np.isfinite(gap_seconds) or gap_seconds < 0:
+            raise ValueError("gap_seconds must be finite and nonnegative.")
 
-            # Subset y (and X if necessary)
-            y = y[selected_indices]
-            X = X[selected_indices, :, :]
-            
-            
-        if self.num_classes == 5:
-            print("5")
-            y[y<=2] = 0
-            y[y==3] = 1
-            y[y==4] = 2
-            y[(y==5) | (y==6)] = 3
-            y[y==7] = 4
-            y[y>=8] = 5
-            
-            X = X[y<=4,:,:]
-            y = y[y<=4]
-            
+        train_fraction = 1.0 - validation_fraction - test_fraction
+        gap_samples = int(round(gap_seconds * sfreq))
+
+        plans = {"train": [], "validation": [], "test": []}
+        partitions = []
+        previous_stop = 0
+
+        left_margin = gap_samples // 2
+        right_margin = gap_samples - left_margin
+
+        for start, duration, event_id in sorted(events, key=lambda event: event[0]):
+            label = map_label(event_id)
+            if label is None:
+                continue
+
+            stop = start + duration
+            if start < 0 or duration <= 0 or stop > raw.n_times:
+                raise ValueError(
+                    f"Event {event_id} has invalid bounds [{start}, {stop})."
+                )
+            if start < previous_stop:
+                raise ValueError(f"Event {event_id} overlaps another selected event.")
+            previous_stop = stop
+
+            # Outer margins separate the end of one event from the next.
+            left = start + left_margin
+            right = stop - right_margin
+
+            # Reserve two internal gaps: train/validation and validation/test.
+            usable = right - left - 2 * gap_samples
+            if usable <= 0:
+                raise ValueError(f"Event {event_id} is too short for these gaps.")
+
+            train_length = int(usable * train_fraction)
+            val_length = int(usable * validation_fraction)
+            test_length = usable - train_length - val_length
+
+            if min(train_length, val_length, test_length) < epoch_samples:
+                raise ValueError(
+                    f"Event {event_id} cannot fit one complete epoch in each "
+                    "of training, validation, and testing. Reduce the gap "
+                    "or revise the split fractions."
+                )
+
+            train_stop = left + train_length
+            val_start = train_stop + gap_samples
+            val_stop = val_start + val_length
+            test_start = val_stop + gap_samples
+
+            bounds = {
+                "train": (left, train_stop),
+                "validation": (val_start, val_stop),
+                "test": (test_start, right),
+            }
+
+            partitions.append({
+                "event_id": int(event_id),
+                "class": int(label),
+                **{
+                    phase: [int(first), int(last)]
+                    for phase, (first, last) in bounds.items()
+                },
+            })
+
+            for phase, (first, last) in bounds.items():
+                for window_start in range(
+                    first, last - epoch_samples + 1, epoch_samples
+                ):
+                    plans[phase].append((
+                        window_start,
+                        window_start + epoch_samples,
+                        label,
+                    ))
+
+        seed = int(getattr(self, "seed", 15))
+        train_seed, val_seed, test_seed = np.random.SeedSequence(seed).spawn(3)
+
+        train_rng = np.random.default_rng(train_seed)
+        val_rng = np.random.default_rng(val_seed)
+        test_rng = np.random.default_rng(test_seed)
+
+        train_plan = np.asarray(plans["train"], dtype=np.int64)
+        val_plan = np.asarray(plans["validation"], dtype=np.int64)
+        test_plan = np.asarray(plans["test"], dtype=np.int64)
+
+        n_train = int(self.CFG2.n_samples_train)
+        n_val = int(self.CFG2.n_samples_val)
+        n_test = int(self.CFG2.n_samples_test)
+        n_classes = self.num_classes
         
-        if self.num_classes == 2:
-            print("2")
-            y[y<=2] = 0
-            y[y==4] = 1
-            y[(y==3) | (y>4)] = 2
-            
-            X = X[y<=1,:,:]
-            y = y[y<=1]
-            
-            # Find indices of 0s and 1s
-            indices_0 = np.where(y == 0)[0]
-            indices_1 = np.where(y == 1)[0]
+        groups = [
+            np.flatnonzero(train_plan[:, 2] == label)
+            for label in range(n_classes)
+        ]
 
-            # Find the minimum count between the two
-            min_count = min(len(indices_0), len(indices_1))
+        per_class = min(
+            n_train // n_classes,
+            min(len(group) for group in groups),
+        )
+        selected = []
 
-            # Randomly sample min_count from both 0 and 1 indices
-            selected_0 = np.random.choice(indices_0, min_count, replace=False)
-            selected_1 = np.random.choice(indices_1, min_count, replace=False)
-
-            # Combine the selected indices and shuffle them
-            selected_indices = np.concatenate([selected_0, selected_1])
-            np.random.shuffle(selected_indices)
-
-            # Subset y (and X if necessary)
-            y = y[selected_indices]
-            X = X[selected_indices, :, :]
-            
-        y = torch.nn.functional.one_hot(torch.Tensor(y).to(torch.int64), num_classes=int(max(y))+1) * 1.0
-
-        X = X.transpose(1,2,0)
-
-
-        min_val = np.min(X)
-        max_val = np.max(X)
-
-        # Normalize the tensor between 0 and 1
-        #X = (X - min_val) / (max_val - min_val)
-        X = X/max_val
-        #X = (X - np.mean(X))/np.std(X)
-        X= np.transpose(X, (2, 1, 0))
-
-        x_train, x_test, y_train, y_test = train_test_split(torch.tensor(X),torch.tensor(y),test_size=0.30,random_state=15)
-
-        print("xshape", x_train.shape)
-        self.train_dataset = None # Deallocate        
-        self.val_dataset = None # Deallocate
-        self.train_dataset = MNISTBrain(x_train, y_train, 'train', self.CFG2)
-        self.val_dataset = MNISTBrain(x_test, y_test, 'validation', self.CFG2) # or test after validation
+        print("train_plan", train_plan[:,2], len(train_plan[:,2]))
         
+        selected = np.concatenate([
+            train_rng.choice(group, size=per_class, replace=False)
+            for group in groups
+        ])
+        train_plan = train_plan[train_rng.permutation(selected)]
+
+        print(
+            f"Selected {len(train_plan)} training epochs "
+            f"({per_class} per class); requested {n_train}."
+        )
+
+        val_plan = val_plan[
+            val_rng.choice(len(val_plan), size=min(n_val,len(val_plan)), replace=False)
+        ]
+        test_plan = test_plan[
+            test_rng.choice(len(test_plan), size=min(n_test,len(test_plan)), replace=False)
+        ]
         
-    def load_model_from_file(self, pretrained):
-        self.model.load_state_dict(torch.load(pretrained))
+        def materialize(plan):
+            """Extract only selected, nonoverlapping epochs."""
+            values = np.empty(
+                (len(plan), epoch_samples, len(raw.ch_names)),
+                dtype=np.float64,
+            )
+            for index, (first, last, _) in enumerate(plan):
+                values[index] = raw.get_data(
+                    start=int(first), stop=int(last)
+                ).T
+
+            if not np.isfinite(values).all():
+                raise ValueError("EEG contains nonfinite values.")
+
+            targets = torch.nn.functional.one_hot(
+                torch.from_numpy(plan[:, 2].copy()),
+                num_classes=self.num_classes,
+            ).float()
+            return torch.from_numpy(values), targets
+
+        x_train, y_train = materialize(train_plan)
+        x_val, y_val = materialize(val_plan)
+        x_test, y_test = materialize(test_plan)
+        del raw
+
+        scale = float(x_train.abs().max().item())
+        if not np.isfinite(scale) or scale == 0:
+            raise ValueError("Invalid training maximum absolute amplitude.")
+
+        x_train = x_train / scale
+        x_val = x_val / scale
+        x_test = x_test / scale
+
+        self.set_datasets(
+            TensorDataset(x_train, y_train),
+            TensorDataset(x_val, y_val),
+            TensorDataset(x_test, y_test),
+        )
+
+        print("Requested train/validation:", n_train, n_val)
+        print("Actual train/validation:", len(x_train), len(x_val))
+        print("Training class counts:",
+            torch.bincount(y_train.argmax(1), minlength=n_classes).tolist())
+        print("Validation class counts:",
+            torch.bincount(y_val.argmax(1), minlength=n_classes).tolist())
+        print("Testing class counts:",
+            torch.bincount(y_test.argmax(1), minlength=n_classes).tolist())
+        print("Gap in seconds:", gap_seconds)
         
-    def train(self, epoch=0, batches_val=-1, custom_plotter=None):
-        loss_fun = nn.MSELoss().to(device)
-  
-        loss_record = []
-        accuracies = []
-        start_time = time.time()
-        train_loader = torch.utils.data.DataLoader(self.train_dataset, batch_size=self.CFG1.train_batch_sz, shuffle=True)
-        
-        batch_idx = 0
-           
-        for batch, expected in train_loader:       
-            print(batch_idx)
-            self.optimizer.zero_grad()  
-        
-            V2_out = self.model(batch[:,:,0:self.CFG1.model_dims[0]].to(device))
-            out_avg = torch.mean(V2_out, dim=1)
+        self.set_datasets(
+            TensorDataset(x_train, y_train),
+            TensorDataset(x_val, y_val),
+            TensorDataset(x_test, y_test),
+        )
+
+    def _batch(self, batch, expected):
+        non_blocking = self.device.type == 'cuda'
+        return (batch[:, :, :self.CFG1.model_dims[0]].to(self.device, dtype=torch.float32, non_blocking=non_blocking),
+                expected.to(self.device, dtype=torch.float32, non_blocking=non_blocking))
+
+    def _loss(self, output, expected):
+        return nn.functional.mse_loss(output, expected)
+
+    def train(self, epoch=0, batches_val=-1, *,
+              validate_train=False, validate_at_end=True):
+        """
+        Training on one epoch at with evaluation at the end of the epoch and when batches_val is positive.
+        Returns accuracies, losses.
+        """
+        if not isinstance(batches_val, int) or batches_val == 0 or batches_val < -1:
+            raise ValueError("batches_val must be -1 or a positive integer")
+
+        loader = self._loader('train', shuffle=True)
+        self.model.train()
+        optimizer = self.optimizer
+        losses = torch.empty(len(loader), device=self.device)
+        total_loss = torch.zeros((), device=self.device)
+        samples, accuracies, last_validation = 0, [], 0
+        start = time.perf_counter()
+
+        for batch_index, (batch, expected) in enumerate(loader, 1):
+            print(batch_index)
+            batch, expected = self._batch(batch, expected)
+            optimizer.zero_grad(set_to_none=True)
+            try:
+                output = self.model(batch).mean(dim=1)
+                loss = self._loss(output, expected)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm,
+                                        error_if_nonfinite=True)
+            except Exception:
+                optimizer.zero_grad(set_to_none=True)
+                raise
             
-            loss = loss_fun(out_avg, expected.to(device))
-            loss_record.append(loss.detach())
-                          
-            loss.backward()
-            
-            for W in self.model.Ws:
-                nn.utils.clip_grad_norm_(W.weight, 1000.0)
-                try:
-                    if W.weight.grad is not None:  # Ensure grad is not None
-                        W.weight.grad[torch.isnan(W.weight.grad)] = 0.0
-                except Exception as e:
-                    print(f"Error processing gradient for layer {W}: {e}")
-            self.optimizer.step()
-       
-            batch_idx += 1
-            
-            
-            if batches_val > 0 and batch_idx % batches_val == 0:
-                print("training error", self.validate(epoch, batch_idx, False))
-            
-                print(batch_idx, float(loss.detach()), time.time() - start_time)
-                accuracy = self.validate(epoch, batch_idx)
-                
-                accuracies.append(accuracy)
-            torch.cuda.empty_cache()
+            optimizer.step()
+            losses[batch_index - 1] = loss.detach()
+            total_loss += loss.detach() * len(batch)
+            samples += len(batch)
+
+            if batches_val > 0 and batch_index % batches_val == 0:
+                if validate_train:
+                    logger.info("Training accuracy %.2f%%", self.validate(epoch, batch_index, False))
+                accuracies.append(self.validate(epoch, batch_index))
+                last_validation = batch_index
+        if validate_at_end and last_validation != len(loader):
+            if validate_train:
+                logger.info("Training accuracy %.2f%%", self.validate(epoch, len(loader), False))
+            accuracies.append(self.validate(epoch, len(loader)))
+        loss_record = losses.cpu().tolist()
+        self.last_epoch = dict(epoch=epoch, batches=len(loader), samples=samples,
+                               mean_loss=total_loss.item() / samples,
+                               elapsed_seconds=time.perf_counter() - start,
+                               validation_accuracy=accuracies[-1] if accuracies else None)
+        logger.info("Epoch %s: %s", epoch, self.last_epoch)
         return accuracies, loss_record
-            
-        
-    def validate(self, epoch=0, batch_idx=-1, use_val_dataset=True):
-        dataset = self.val_dataset if use_val_dataset else self.train_dataset
-        val_loader = torch.utils.data.DataLoader(dataset, batch_size=self.CFG1.test_batch_sz, shuffle=False)
-        n_hit = 0
+
+    def _evaluate(self, phase):
+        loader = self._loader(phase)
+        modes = [(module, module.training) for module in self.model.modules()]
+        n_hit = torch.zeros((), dtype=torch.long, device=self.device)
         n_total = 0
-        start = time.time()
-        for batch, expected in val_loader:
-            with torch.no_grad():
-                out_avg = torch.mean(self.model(batch[:,:,0:self.CFG1.model_dims[0]].to(device)), dim=1)
-                guess = torch.argmax(out_avg, dim=1).cpu()
-                labels = torch.argmax(expected, dim=1)
-                n_hit += torch.sum(guess == labels)
-            start = time.time()
-            n_total += batch.shape[0]
-            
-        print("%f" % (n_hit / n_total * 100.0))
-        return float(n_hit / n_total * 100.0)
-    
-    # This function measures the gradients within a sliding window. 
-    def measure_sliding_gradients(self, window_size, filename, stride=-1):
-        loss_fun = nn.MSELoss().to(device)
 
-        if stride == -1:
-            stride = window_size # By default, slide window with no overlap.
-        
-        # Pick a random training sample to look at. 
-        idx = int(torch.randint(0, len(self.train_dataset), ()))
-        print(idx)
-        sample, target = self.train_dataset[idx]
-        
-        sample = sample[:,0:self.CFG1.model_dims[0]]
-        target = target.to(device)
-        sample = sample.unsqueeze(0)
-        
-        # Feed forward.
-        T2_out, interm_out = self.model(sample.to(device), include_intermediates = True)
-        T2_out = T2_out.squeeze() # Shape is [SIM_T, OUTPUT_SIZE].
-        window_cnt = int((T2_out.shape[0] - window_size) / stride + 1) 
-        print("window count", window_cnt, T2_out.shape)
+        self.model.eval()
         try:
-            avgs = torch.zeros((window_cnt, T2_out.shape[1]), requires_grad=True).to(device)
-            for i in range(window_cnt):
-                avgs[i, :] = torch.mean(T2_out[i * stride: i * stride+window_size, :], 0)
-        except Exception as e:
-            print(f"Error occurred while computing averages: {e}")
-            avgs = torch.stack([
-                T2_out[i * stride : i * stride + window_size, :].mean(0)
-                for i in range(window_cnt)
-            ])
-            avgs.retain_grad()
+            with torch.no_grad():
+                for batch, expected in loader:
+                    batch, expected = self._batch(batch, expected)
+                    output = self.model(batch).mean(dim=1)
 
-        print("Computing sliding window gradients")       
+                    n_hit += (
+                        output.argmax(dim=1) == expected.argmax(dim=1)
+                    ).sum()
+                    n_total += len(batch)
+        finally:
+            for module, mode in modes:
+                module.training = mode
+
+        return 100.0 * n_hit.item() / n_total
+
+
+    def validate(self, epoch=0, batch_idx=-1, use_val_dataset=True):
+        phase = "validation" if use_val_dataset else "train"
+        return self._evaluate(phase)
+
+
+    def test(self):
+        return self._evaluate("test")
+
+    def load_model_from_file(self, pretrained, *, restore_optimizer=False, trusted_checkpoint=False):
+        """
+        Read a plain state_dict or checkpoint bundle
+        """
+        state = torch.load(pretrained, map_location=self.device, weights_only=not trusted_checkpoint)
+        weights = state.get('model_state_dict', state.get('state_dict', state))
+
+        self.model.load_state_dict(weights, strict=True)
+        if restore_optimizer:
+            self.optimizer.load_state_dict(state['optimizer_state_dict'])
+        else:
+            # Adam moments from a different set of weights must not be reused.
+            self._optimizer = None
         
-        sliding_grad_1 = torch.zeros(window_cnt, self.CFG1.model_dims[0] * self.CFG1.model_dims[1]).to(device)
-        sliding_grad_2 = torch.zeros(window_cnt, self.CFG1.model_dims[1] * self.CFG1.model_dims[2]).to(device)
-        
-        print(sliding_grad_1.shape)
-        print(sliding_grad_2.shape)
-        W1s = []
-        W2s = []
-        partialavs = []
+        return state
+
+    def measure_sliding_gradients(self, window_size, filename, stride=-1, *, include_diagnostics=False):
+        """Measure derivatives without optimizer steps or parameter-gradient mutation.
+
+        Main output keys are compatible with HebbianLearning.ipynb. Expensive
+        per-window dL/d(avgs) matrices are optional, detached CPU snapshots.
+        """
+        if stride == -1:
+            stride = window_size
+        if not isinstance(window_size, int) or window_size <= 0:
+            raise ValueError("window_size must be a positive integer")
+        if not isinstance(stride, int) or stride <= 0:
+            raise ValueError("stride must be a positive integer")
+        if len(self.model.Ws) != 2:
+            raise ValueError("Sliding-gradient export expects two weight layers")
+        model_device = next(self.model.parameters()).device
+        if self.train_dataset is None or len(self.train_dataset) == 0:
+            raise ValueError("Gradient measurement requires a nonempty dataset")
+        idx = int(torch.randint(0, len(self.train_dataset), (),
+                               generator=getattr(self, '_analysis_generator', None)))
+        sample, target = self.train_dataset[idx]
+        sample = sample[:, :self.CFG1.model_dims[0]].unsqueeze(0).to(model_device)
+        target = target.to(model_device)
+        if window_size > sample.shape[1]:
+            raise ValueError("window_size exceeds the number of timesteps")
+
+        T2_out, interm_out = self.model(sample, include_intermediates=True)
+        T2_out = T2_out.squeeze(0)
+        # unfold returns a view [window, output, window_size].
+        avgs = T2_out.unfold(0, window_size, stride).mean(dim=-1)
+        window_cnt = avgs.shape[0]
+        weights = tuple(layer.weight for layer in self.model.Ws)
+        buffers = [torch.empty((window_cnt, weight.numel()), dtype=weight.dtype) for weight in weights]
         losses = []
-        
-        print("windowcnt", window_cnt)
+        partialavs = []
         for i in range(window_cnt):
-            print(i)
-            self.optimizer.zero_grad()
-            loss = loss_fun(avgs[i, :], target)
-            loss.backward(retain_graph=True)   
-            
-             # Gradients dL/dw
-            sliding_grad_1[i, :] = self.model.Ws[0].weight.grad[:, :].flatten()
-            sliding_grad_2[i, :] = self.model.Ws[1].weight.grad[:, :].flatten()
-            
-            
-            losses.append(loss)            
-            partialavs.append(avgs.grad)     
-            W1s.append(self.model.Ws[0].weight)
-            W2s.append(self.model.Ws[1].weight)
-            
-        fl_prefix = f'{window_size}_{stride}_networkOut'
-        z = ZANJ()
-        z.save(
-          dict(
-            losses = losses,
-            avgs = avgs,
-            partialavs = partialavs,
-            W1s =  W1s,
-            W2s =  W2s,
-            idx = idx,
-            sample = sample,
-            target = target,
-            window_cnt = window_cnt,
-            T2_out=T2_out,
-            interm_out = interm_out,
-            sliding_grad_1 = sliding_grad_1,
-            sliding_grad_2 = sliding_grad_2
-          ),
-         filename,
+            loss = torch.nn.functional.mse_loss(avgs[i], target)
+            requested = weights + ((avgs,) if include_diagnostics else ())
+            grads = torch.autograd.grad(loss, requested, retain_graph=i + 1 < window_cnt)
+            for buffer, grad in zip(buffers, grads[:2]):
+                buffer[i].copy_(grad.detach().reshape(-1).cpu())
+            losses.append(loss.detach().cpu())
+            partialavs.append(grads[2].detach().cpu().clone() if include_diagnostics else None)
+
+        # Weights do not change during this measurement. Reuse one CPU snapshot.
+        snapshots = [weight.detach().cpu().clone() for weight in weights]
+        ZANJ().save(
+            dict(
+                losses=losses, avgs=avgs.detach().cpu(), partialavs=partialavs,
+                W1s=[snapshots[0]] * window_cnt, W2s=[snapshots[1]] * window_cnt,
+                idx=idx, sample=sample.detach().cpu(), target=target.detach().cpu(),
+                window_cnt=window_cnt, T2_out=T2_out.detach().cpu(),
+                interm_out=[tuple(value.detach().cpu() for value in pair) for pair in interm_out],
+                sliding_grad_1=buffers[0], sliding_grad_2=buffers[1],
+                window_size=window_size, stride=stride, dt=self.CFG1.dt,
+                include_diagnostics=include_diagnostics,
+            ),
+            filename,
         )

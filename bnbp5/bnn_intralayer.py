@@ -1,8 +1,9 @@
-## Biological neural network models.
+"""
+Biological neural network models.
 
-# Copyright (c) 2026 Madelyn Cruz and Daniel Forger
-# University of Michigan
-# All rights reserved.
+Copyright (c) 2026 Madelyn Cruz and Daniel Forger
+University of Michigan. All rights reserved.
+"""
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -79,11 +80,11 @@ class BNNConfig(SerializableDataclass):
     file_name: str = serializable_field(default="")
     
     neuron_params: dict[str, float] = serializable_field(
-        default_factory = lambda: _HH_PARAMS,
+        default_factory = lambda: _HH_PARAMS.copy(),
     )
         
     synapse_params: dict[str, float] = serializable_field(
-        default_factory = lambda: _SYNAPSE_PARAMS,
+        default_factory = lambda: _SYNAPSE_PARAMS.copy(),
     )
         
     @property
@@ -111,6 +112,33 @@ class NNSConfig(SerializableDataclass):
         # [128, 100, 6] - Anesthesia, [454, 100, 2] - DoD
     snn_beta: float = serializable_field(default=0.95) # 0.95 - Anesthesia, 0.99 - DoD
     
+def _vtrap(x, scale):
+    """Stable x / (1 - exp(-x / scale)), including its derivative at zero."""
+    u = x / scale
+    small = u.abs() < 1e-3
+    # Avoid evaluating 0/0 in the inactive branch: autograd still visits it.
+    safe_u = torch.where(small, torch.ones_like(u), u)
+    regular = scale * safe_u / (-torch.expm1(-safe_u))
+    series = scale * (1 + u / 2 + u.square() / 12)
+    return torch.where(small, series, regular)
+
+
+def _hh_rates(v, beta_n_modified=False):
+    """Table S2 rates, with analytic limits at V=25 and V=-35 mV."""
+    delta_n, delta_m = v - 25, v + 35
+    # Evaluate four equal-scale rates together to reduce small GPU launches.
+    traps = _vtrap(torch.stack((delta_n, delta_m, -delta_n, -delta_m)), 9.0)
+    aN = 0.02 * traps[0]
+    aM = 0.182 * traps[1]
+    aH = 0.25 * torch.exp((-v - 90) / 12.0)
+    bN = 0.002 * traps[2]
+    if beta_n_modified:
+        bN = 0.125 * torch.exp((-v + 70) / 19.7)
+    bM = 0.124 * traps[3]
+    bH = 0.25 * torch.exp((v + 34) / 12.0)
+    return aN, aM, aH, bN, bM, bH
+
+
 class model_HH_Gap(nn.Module):
     """HH with Gap Junctions"""
     def __init__(self, cfg: BNNConfig, dim: int):
@@ -123,6 +151,8 @@ class model_HH_Gap(nn.Module):
     def forward(self, z: Float[torch.Tensor, "B T self.dim"]) -> Float[torch.Tensor, "B T self.dim"]:
         # batch size, num timesteps
         B: int; T: int
+        if z.ndim != 3 or z.shape[1] == 0 or z.shape[2] != self.dim:
+            raise ValueError(f"Expected [batch, positive time, {self.dim}], got {tuple(z.shape)}")
         B, T = z.shape[:2]
         dt = self.dt
         
@@ -134,54 +164,41 @@ class model_HH_Gap(nn.Module):
         Vt = P['Vt']; Kp = P['Kp'];
         a_d = P['a_d']; a_r = P['a_r'];  
 
-        # init voltage array and m, n, h 
-        V: Float[torch.Tensor, "B T self.dim"] = torch.ones((B, T, self.dim)).to(device)*-70.0
-        m: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        n: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        h: Float[torch.Tensor, "B T self.dim"] = torch.ones((B, T, self.dim)).to(device)
-        
-        pow1 = torch.zeros((B, self.dim)).to(device)
-        pow2 = torch.zeros((B, self.dim)).to(device)
+        # Keep only current gates; autograd retains the required dependencies.
+        v = z.new_full((B, self.dim), -70.0)
+        m = z.new_zeros((B, self.dim))
+        n = z.new_zeros((B, self.dim))
+        h = z.new_ones((B, self.dim))
+        voltage_history = [v]
 
         # simulation loop
         for k in range(1, T):
-            pow1 = gna * (m[:, k-1, :].clone() ** 3) * h[:, k-1, :].clone()
-            pow2 = gk * n[:, k-1, :].clone() ** 4
+            pow1 = gna * (m ** 3) * h
+            pow2 = gk * n ** 4
             
             G_scaled = (dt / 2) * (pow1 + pow2 + gl)
             E = pow1 * Ena + pow2 * Ek + gl * El
             
-            V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z[:, k-1, :])) / (1 + G_scaled)
+            v_next = (v * (1 - G_scaled) + dt * (E + Iapp + z[:, k-1, :])) / (1 + G_scaled)
             
-            aN = 0.02 * (V[:, k, :] - 25) / (1 - torch.exp((-V[:, k, :] + 25) / 9.0))
-            aM = 0.182 * (V[:, k, :] + 35) / (1 - torch.exp((-V[:, k, :] - 35) / 9.0))
-            aH = 0.25 * torch.exp((-V[:, k, :] - 90) / 12.0)
-            
-            bN = -0.002 * (V[:, k, :] - 25) / (1 - torch.exp((V[:, k, :] - 25) / 9.0))
-            if P['beta_n_modified']:
-                bN = 0.125 * torch.exp((-V[:, k, :] + 70) / 19.7)
-            bM = -0.124 * (V[:, k, :] + 35) / (1 - torch.exp((V[:, k, :] + 35) / 9.0))
-            bH = 0.25 * torch.exp((V[:, k, :] + 34) / 12.0)
-            
-            # zero denominators
-            if torch.any(V[:, k, :] == 25) or torch.any(V[:, k, :] == -35):
-                aN[torch.where(V[:, k, :] == 25)] = 0.18
-                bN[torch.where(V[:, k, :] == 25)] = 0.08
-                aM[torch.where(V[:, k, :] == -35)] = 1.638
-                bM[torch.where(V[:, k, :] == -35)] = 1.16
-                
-            m[:, k, :] = (aM * dt + (1 - dt / 2 * (aM + bM)) * m[:, k-1, :].clone()) / (dt / 2 * (aM + bM) + 1)
-            n[:, k, :] = (aN * dt + (1 - dt / 2 * (aN + bN)) * n[:, k-1, :].clone()) / (dt / 2 * (aN + bN) + 1)
-            h[:, k, :] = (aH * dt + (1 - dt / 2 * (aH + bH)) * h[:, k-1, :].clone()) / (dt / 2 * (aH + bH) + 1)    
+            aN, aM, aH, bN, bM, bH = _hh_rates(v_next, P["beta_n_modified"])
+
+            m = (aM * dt + (1 - dt / 2 * (aM + bM)) * m) / (dt / 2 * (aM + bM) + 1)
+            n = (aN * dt + (1 - dt / 2 * (aN + bN)) * n) / (dt / 2 * (aN + bN) + 1)
+            h = (aH * dt + (1 - dt / 2 * (aH + bH)) * h) / (dt / 2 * (aH + bH) + 1)    
             
             # lateral inhibition
             if P['lat_inhibition']:
                 with torch.no_grad():
-                    V_sub = V[:, k, :] + 70
+                    V_sub = v_next + 70
                     below = V_sub.le(60)
-                    V[:, k, :] = torch.where(below, V_sub * (below.sum(axis=1).reshape(-1,1) / self.L) - 70,  V_sub - 70)
+                    inhibited = torch.where(below, V_sub * (below.sum(axis=1).reshape(-1,1) / self.dim) - 70, V_sub - 70)
+                v_next = v_next + (inhibited - v_next).detach()
 
-        print("-- HH Gap Working --")
+            v = v_next
+            voltage_history.append(v)
+
+        V = torch.stack(voltage_history, dim=1)
         if self.plot_interm == True:
             plt.figure(figsize=(15,5))
             plt.subplot(1,2,1)
@@ -229,22 +246,19 @@ class model_HH_RS(nn.Module):
         Iapp = P['Iapp']; Vt = P['Vt']; Kp = P['Kp'];
         vthresh = P['vthresh']; tau_max = P['tau_max'];
         
-        # init voltage array and m, n, h, p
-        V: Float[torch.Tensor, "B T self.dim"] = torch.ones((B, T, self.dim)).to(device)*-70.0
-        m: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        n: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        h: Float[torch.Tensor, "B T self.dim"] = torch.ones((B, T, self.dim)).to(device)
-        p: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        
-        pow1 = torch.zeros((B, self.dim)).to(device)
-        pow2 = torch.zeros((B, self.dim)).to(device)
-        powm = torch.zeros((B, self.dim)).to(device)
-        
+        # Keep only current gates; autograd retains the required dependencies.
+        v = z.new_full((B, self.dim), -70.0)
+        m = z.new_zeros((B, self.dim))
+        n = z.new_zeros((B, self.dim))
+        h = z.new_ones((B, self.dim))
+        p = z.new_zeros((B, self.dim))
+        voltage_history = [v]
+        gate_history = {"m": [m], "n": [n], "h": [h], "p": [p]} if self.plot_interm else None
+
         # inputs weighted (default unweighted)
         z_weight = self.z_weight
         
         if self.network_type >= 1:
-            print("-- Network has intralayer connections. --")
             # synaptic parameters
             P_syn = self.P_syn
             
@@ -252,69 +266,66 @@ class model_HH_RS(nn.Module):
             threshold = P_syn['threshold']
             taus = P_syn['taus']
             
-            spike_times = torch.zeros((z.shape[0], z.shape[2])).to(device)        
+            spike_times = z.new_zeros((B, self.dim))        
 
         # simulation loop
         for k in range(1, T):
-            pow1 = gna * (m[:, k-1, :].clone() ** 3) * h[:, k-1, :].clone()
-            pow2 = gk * n[:, k-1, :].clone() ** 4
-            powm = gm *p[:, k-1, :].clone() 
+            pow1 = gna * (m ** 3) * h
+            pow2 = gk * n ** 4
+            powm = gm *p 
             
             G_scaled = (dt / 2) * (pow1 + pow2 + gl + powm)
             E = pow1 * Ena + pow2 * Ek + gl * El + powm * Ek
             
             if self.network_type == 1:
                 # vectorized version of code above
-                threshold_mask = (V[:, k - 1, :] >= threshold)
+                threshold_mask = (v >= threshold)
                 refractory_mask = ((k - 1 - spike_times) > refractory_period)
                 valid_spikes_mask = (threshold_mask & refractory_mask)
                 spike_times[valid_spikes_mask] = k - 1
                 spikes_windowed = torch.exp(-(k-spike_times)/taus) * (spike_times > 0)
                 
-                synaptic_activity = torch.matmul(spikes_windowed.to(device), self.syn_weights.to(device)) 
+                synaptic_activity = torch.matmul(spikes_windowed, self.syn_weights) 
                 
-                V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z_weight*z[:, k-1, :] + synaptic_activity)) / (1 + G_scaled)  
+                v_next = (v * (1 - G_scaled) + dt * (E + Iapp + z_weight*z[:, k-1, :] + synaptic_activity)) / (1 + G_scaled)  
             
             # original BNN, feedforward network
             else:
-                V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z_weight*z[:, k-1, :])) / (1 + G_scaled)
+                v_next = (v * (1 - G_scaled) + dt * (E + Iapp + z_weight*z[:, k-1, :])) / (1 + G_scaled)
             
-            aH = 0.25 * torch.exp((-V[:, k, :] - 90) / 12.0)
-            bH = 0.25 * torch.exp((V[:, k, :] + 34) / 12.0)
+            aN, aM, aH, bN, bM, bH = _hh_rates(v_next)
+
+            pinf = 1 / (1 + torch.exp(-(v_next + 35) / 10.0))
+            taup = tau_max / (3.3 *  torch.exp((v_next + 35) / 20.0) +  torch.exp(-(v_next + 35) / 20.0))
             
-            # zero denominators
-            if torch.any(V[:, k, :] == 25) or torch.any(V[:, k, :] == -35):
-                aN[torch.where(V[:, k, :] == 25)] = 0.18
-                bN[torch.where(V[:, k, :] == 25)] = 0.08
-                aM[torch.where(V[:, k, :] == -35)] = 1.638
-                bM[torch.where(V[:, k, :] == -35)] = 1.16
-                
-            else:
-                aN = 0.02 * (V[:, k, :] - 25) / (1 - torch.exp((-V[:, k, :] + 25) / 9.0))
-                aM = 0.182 * (V[:, k, :] + 35) / (1 - torch.exp((-V[:, k, :] - 35) / 9.0))
-                bN = -0.002 * (V[:, k, :] - 25) / (1 - torch.exp((V[:, k, :] - 25) / 9.0))
-                bM = -0.124 * (V[:, k, :] + 35) / (1 - torch.exp((V[:, k, :] + 35) / 9.0))
-                
-            pinf = 1 / (1 + torch.exp(-(V[:, k, :] + 35) / 10.0))
-            taup = tau_max / (3.3 *  torch.exp((V[:, k, :] + 35) / 20.0) +  torch.exp(-(V[:, k, :] + 35) / 20.0))
             
-            taup[torch.where(taup == 0)] = tau_max / (3.3 *   +  1 / 20.0)   
-            taup[torch.where(taup == -0.5)] = tau_max / (3.3 *   +  1 / 20.0) 
-            taup[torch.where(V[:, k, :] == -35)] = tau_max / (3.3 *   +  1 / 20.0)   
-            
-            m[:, k, :] = (aM * dt + (1 - dt / 2 * (aM + bM)) * m[:, k-1, :].clone()) / (dt / 2 * (aM + bM) + 1)
-            n[:, k, :] = (aN * dt + (1 - dt / 2 * (aN + bN)) * n[:, k-1, :].clone()) / (dt / 2 * (aN + bN) + 1)
-            h[:, k, :] = (aH * dt + (1 - dt / 2 * (aH + bH)) * h[:, k-1, :].clone()) / (dt / 2 * (aH + bH) + 1)
-            p[:, k, :] = (pinf/taup * dt + (1 - dt / (2 * taup)) * p[:, k-1, :].clone()) /  (dt / (2 * taup) + 1) 
+            m = (aM * dt + (1 - dt / 2 * (aM + bM)) * m) / (dt / 2 * (aM + bM) + 1)
+            n = (aN * dt + (1 - dt / 2 * (aN + bN)) * n) / (dt / 2 * (aN + bN) + 1)
+            h = (aH * dt + (1 - dt / 2 * (aH + bH)) * h) / (dt / 2 * (aH + bH) + 1)
+            p = (pinf/taup * dt + (1 - dt / (2 * taup)) * p) /  (dt / (2 * taup) + 1) 
             
             # lateral inhibition
             if P['lat_inhibition']:
                 with torch.no_grad():
-                    V_sub = V[:, k, :] + 70
+                    V_sub = v_next + 70
                     below = V_sub.le(60)
-                    V[:, k, :] = torch.where(below, V_sub * (below.sum(axis=1).reshape(-1,1) / self.L) - 70,  V_sub - 70)
+                    inhibited = torch.where(below, V_sub * (below.sum(axis=1).reshape(-1,1) / self.dim) - 70, V_sub - 70)
+                v_next = v_next + (inhibited - v_next).detach()
         
-        print("-- HH RS Working --")
+            v = v_next
+            voltage_history.append(v)
+            if gate_history is not None:
+                gate_history["m"].append(m)
+                gate_history["n"].append(n)
+                gate_history["h"].append(h)
+                gate_history["p"].append(p)
+
+        V = torch.stack(voltage_history, dim=1)
+        if gate_history is not None:
+            m = torch.stack(gate_history["m"], dim=1)
+            n = torch.stack(gate_history["n"], dim=1)
+            h = torch.stack(gate_history["h"], dim=1)
+            p = torch.stack(gate_history["p"], dim=1)
         if self.plot_interm == True:            
             plt.figure(figsize=(15,5))
             plt.subplot(1,2,1)
@@ -330,7 +341,6 @@ class model_HH_RS(nn.Module):
             plt.show()
             
             # saving state variables            
-            print("SAVING HH")            
             np.savez(f"hh_vars_{self.file_name}_{self.dim}.npz", V=V.cpu().detach().numpy(), m=m.cpu().detach().numpy(), h=h.cpu().detach().numpy(), n=n.cpu().detach().numpy(),p=p.cpu().detach().numpy(), z=z.cpu().detach().numpy())
                 
         return torch.sigmoid((V - Vt) / Kp)
@@ -357,82 +367,58 @@ class model_HH_IBN(nn.Module):
         Iapp = P['Iapp']; Vt = P['Vt']; Kp = P['Kp'];
         vthresh = P['vthresh']; tau_max = P['tau_max'];
         
-        # init voltage array and m, n, h, p, q, r
-        V: Float[torch.Tensor, "B T self.dim"] = torch.ones((B, T, self.dim)).to(device)*-70.0
-        m: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        n: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        h: Float[torch.Tensor, "B T self.dim"] = torch.ones((B, T, self.dim)).to(device)
-        p: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        q: Float[torch.Tensor, "B T self.dim"] = torch.zeros((B, T, self.dim)).to(device)
-        r: Float[torch.Tensor, "B T self.dim"] = torch.ones((B, T, self.dim)).to(device)
-        
-        pow1 = torch.zeros((B, self.dim)).to(device)
-        pow2 = torch.zeros((B, self.dim)).to(device)
-        powm = torch.zeros((B, self.dim)).to(device)
-        powhca = torch.zeros((B, self.dim)).to(device)
+        # Keep only current gates; autograd retains the required dependencies.
+        v = z.new_full((B, self.dim), -70.0)
+        m = z.new_zeros((B, self.dim))
+        n = z.new_zeros((B, self.dim))
+        h = z.new_ones((B, self.dim))
+        p = z.new_zeros((B, self.dim))
+        q = z.new_zeros((B, self.dim))
+        r = z.new_ones((B, self.dim))
+        voltage_history = [v]
 
         # simulation loop
         for k in range(1, T):
-            pow1 = gna * (m[:, k-1, :].clone() ** 3) * h[:, k-1, :].clone()
-            pow2 = gk * n[:, k-1, :].clone() ** 4
-            powm = gm *p[:, k-1, :].clone() 
-            powhca = ghca * (q[:, k-1, :].clone() ** 2) * r[:, k-1, :].clone()
+            pow1 = gna * (m ** 3) * h
+            pow2 = gk * n ** 4
+            powm = gm *p 
+            powhca = ghca * (q ** 2) * r
             
             G_scaled = (dt / 2) * (pow1 + pow2 + gl + powm + powhca)
             E = pow1 * Ena + pow2 * Ek + gl * El + powm * Ek + powhca * Eca 
             
-            V[:, k, :] = (V[:, k-1, :].clone() * (1 - G_scaled) + dt * (E + Iapp + z[:, k-1, :])) / (1 + G_scaled)
+            v_next = (v * (1 - G_scaled) + dt * (E + Iapp + z[:, k-1, :])) / (1 + G_scaled)
             
-            aN = 0.02 * (V[:, k, :] - 25) / (1 - torch.exp((-V[:, k, :] + 25) / 9.0))
-            aM = 0.182 * (V[:, k, :] + 35) / (1 - torch.exp((-V[:, k, :] - 35) / 9.0))
-            aH = 0.25 * torch.exp((-V[:, k, :] - 90) / 12.0)
+            aN, aM, aH, bN, bM, bH = _hh_rates(v_next)
+
+            pinf = 1 / (1 + torch.exp(-(v_next + 35) / 10.0))
+            taup = tau_max / (3.3 *  torch.exp((v_next + 35) / 20.0) +  torch.exp(-(v_next + 35) / 20.0))
             
-            bN = -0.002 * (V[:, k, :] - 25) / (1 - torch.exp((V[:, k, :] - 25) / 9.0))
-            bM = -0.124 * (V[:, k, :] + 35) / (1 - torch.exp((V[:, k, :] + 35) / 9.0))
-            bH = 0.25 * torch.exp((V[:, k, :] + 34) / 12.0)
+            aQ = 0.055 * _vtrap(v_next + 27, 3.8)
+            aR = 0.000457 * torch.exp((-v_next - 13) / 50.0)
             
-            # aM = 0.32 * (self.V[:, k, :] - vthresh - 13) / (1-  torch.exp(-(self.V[:, k, :] - vthresh - 13)/4))
-            # aH = 0.128 * torch.exp(-(self.V[:, k, :] - vthresh - 17) / 18.0)
-            # aN = 0.032 * (self.V[:, k, :] - vthresh - 15)/ (1-  torch.exp(-(self.V[:, k, :] - vthresh - 15)/5))
+            bQ = 0.94 * torch.exp((-v_next - 75) / 17.0)        
+            bR = 0.0065 / (torch.exp((-v_next - 15) / 28.0) + 1)
             
-            # bM = - 0.28 * (self.V[:, k, :] - vthresh -40) / (1 - torch.exp((self.V[:, k, :]- vthresh -40) / 5.0))
-            # bH = 4/ (1 + torch.exp(-(self.V[:, k, :] -vthresh - 40) / 5.0))
-            # bN = 0.5 * torch.exp((-self.V[:, k, :] + vthresh + 10) / 40.0)
-            
-            pinf = 1 / (1 + torch.exp(-(V[:, k, :] + 35) / 10.0))
-            taup = tau_max / (3.3 *  torch.exp((V[:, k, :] + 35) / 20.0) +  torch.exp(-(V[:, k, :] + 35) / 20.0))
-            
-            aQ = 0.055 * (-V[:, k, :] - 27) / (torch.exp((-V[:, k, :] - 27) / 3.8) - 1)
-            aR = 0.000457 * torch.exp((-V[:, k, :] - 13) / 50.0)
-            
-            bQ = 0.94 * torch.exp((-V[:, k, :] - 75) / 17.0)        
-            bR = 0.0065 / (torch.exp((-V[:, k, :] - 15) / 28.0) + 1)
-            
-            # zero denominators
-            if torch.any(V[:, k, :] == 25) or torch.any(V[:, k, :] == -35):
-                aN[torch.where(V[:, k, :] == 25)] = 0.18
-                bN[torch.where(V[:, k, :] == 25)] = 0.08
-                aM[torch.where(V[:, k, :] == -35)] = 1.638
-                bM[torch.where(V[:, k, :] == -35)] = 1.16
-            
-            if torch.any(V[:, k, :] == -27):
-                aQ[torch.where(V[:, k, :] == 25)] = 0.055*3.8
-                
-            m[:, k, :] = (aM * dt + (1 - dt / 2 * (aM + bM)) * m[:, k-1, :].clone()) / (dt / 2 * (aM + bM) + 1)
-            n[:, k, :] = (aN * dt + (1 - dt / 2 * (aN + bN)) * n[:, k-1, :].clone()) / (dt / 2 * (aN + bN) + 1)
-            h[:, k, :] = (aH * dt + (1 - dt / 2 * (aH + bH)) * h[:, k-1, :].clone()) / (dt / 2 * (aH + bH) + 1)
-            p[:, k, :] = (pinf/taup * dt + (1 - dt / (2 * taup)) * p[:, k-1, :].clone()) /  (dt / (2 * taup) + 1)
-            q[:, k, :] = (aQ * dt + (1 - dt / 2 * (aQ + bQ)) * q[:, k-1, :].clone()) / (dt / 2 * (aQ + bQ) + 1)
-            r[:, k, :] = (aR * dt + (1 - dt / 2 * (aR + bR)) * r[:, k-1, :].clone()) / (dt / 2 * (aR + bR) + 1)
+            m = (aM * dt + (1 - dt / 2 * (aM + bM)) * m) / (dt / 2 * (aM + bM) + 1)
+            n = (aN * dt + (1 - dt / 2 * (aN + bN)) * n) / (dt / 2 * (aN + bN) + 1)
+            h = (aH * dt + (1 - dt / 2 * (aH + bH)) * h) / (dt / 2 * (aH + bH) + 1)
+            p = (pinf/taup * dt + (1 - dt / (2 * taup)) * p) /  (dt / (2 * taup) + 1)
+            q = (aQ * dt + (1 - dt / 2 * (aQ + bQ)) * q) / (dt / 2 * (aQ + bQ) + 1)
+            r = (aR * dt + (1 - dt / 2 * (aR + bR)) * r) / (dt / 2 * (aR + bR) + 1)
             
             # Lateral inhibition
             if P['lat_inhibition']:
                 with torch.no_grad():
-                    V_sub = V[:, k, :] + 70
+                    V_sub = v_next + 70
                     below = V_sub.le(60)
-                    V[:, k, :] = torch.where(below, V_sub * (below.sum(axis=1).reshape(-1,1) / self.L) - 70,  V_sub - 70)
+                    inhibited = torch.where(below, V_sub * (below.sum(axis=1).reshape(-1,1) / self.dim) - 70, V_sub - 70)
+                v_next = v_next + (inhibited - v_next).detach()
         
-        print("-- HH IBN Working --")
+            v = v_next
+            voltage_history.append(v)
+
+        V = torch.stack(voltage_history, dim=1)
         if self.plot_interm == True:
             plt.figure(figsize=(15,5))
             plt.subplot(1,2,1)
@@ -472,7 +458,6 @@ class BNN(ConfiguredModel[BNNConfig]):
         self.Ws: torch.nn.ModuleList[nn.Linear] = nn.ModuleList()
         self.layers: torch.nn.ModuleList[nn.Module] = nn.ModuleList()
         for d1, d2 in zip(self.cfg.model_dims[:-1], self.cfg.model_dims[1:]):
-            print(d1, d2)
             self.Ws.append(nn.Linear(d1, d2, bias=False))
             if self.cfg.DNN:
                 self.layers.append(nn.Sigmoid())
@@ -496,17 +481,13 @@ class BNN(ConfiguredModel[BNNConfig]):
                 
         for W, layer in zip(self.Ws, self.layers):
             # normal BNN
-            print("T shape",T.shape)
             z = W(T)
-            print("z shape",z.shape)
             T = layer(z)
 
             # normalized per layer
             if self.cfg.batchnorm:
-                print("normalizing", T.shape)
                 mnormed = nn.BatchNorm1d(T.shape[-1]).to(device)
                 T=mnormed(T.transpose(2,1).to(device)).transpose(2,1).to(device)
-                print("normalized", T.shape)
 
             # include z in outputs
             if include_intermediates:
@@ -545,23 +526,15 @@ class LSTMModel(ConfiguredModel[NNSConfig]):
         # forward pass through layers
        
         x = F.relu(self.dense(x.float()))  # linear layer with ReLU
-        print("shapesx", x.shape)
         x, (hn, cn) = self.lstm(x)  # LSTM layer
-        print("shapesx", x.shape)
         x = self.dropout(x)  # dropout after LSTM
-        print("shapesx", x.shape)
         x = self.batch_norm1(x[:, -1, :])  # BatchNorm on the last time step of LSTM output
-        print("shapesx", x.shape)
         x = F.relu(self.dense1(x))  # second linear layer with ReLU
-        print("shapesx", x.shape)
         x = self.dropout2(x)  # second dropout
-        print("shapesx", x.shape)
         x = self.batch_norm2(x)  # second BatchNorm
-        print("batchnorm", x.shape)
         #x = F.softmax(self.output_layer(x), dim=1)  # softmax output layer
         x = F.sigmoid(self.output_layer(x))  # sigmoid output layer
         
-        print("final", x.shape)
         return x
     
 @set_config_class(NNSConfig)
@@ -602,10 +575,9 @@ class SNNNet(ConfiguredModel[NNSConfig]):
         
         x=x.float()
 
-        print("XSHAPE", x.shape)
         for step in range(x.shape[1]-1):
             cur1 = self.fc1(x[:,step,:])
-            spk1, mem1 = self.lif1(cur1, x[:,step+1,:])
+            spk1, mem1 = self.lif1(cur1, mem1)
             cur2 = self.fc2(spk1)
             spk2, mem2 = self.lif2(cur2, mem2)
             spk2_rec.append(spk2)
