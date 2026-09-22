@@ -52,6 +52,7 @@ Misc: ipykernel, seaborn
 - run_model.ipynb - training; run using Jupyter or can convert to.py
 - Analyze_BNN_Anesthesia.ipynb - accuracies, weights, etc.
 - HebbianLearning.ipynb - running and visualizing gradients
+- Representational geometry analysis.ipynb - plotting tSNE components using pretrained files (you may train your own models since pretrained models containing hidden layer activities are too large for GitHub or download the sample [file](https://drive.google.com/file/d/1CCvAxgLBJjQ6V_nLoj0aqqvAO0IKqYxu/view?usp=sharing) to data folder before running this script.)
 
 ## Model and training modules
 
