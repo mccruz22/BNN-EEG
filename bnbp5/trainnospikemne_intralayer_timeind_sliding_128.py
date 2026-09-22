@@ -16,7 +16,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from zanj import ZANJ
 
-from bnbp5.bnn_intralayer_codex import BNN
+from bnbp5.bnn_intralayer import BNN
 from bnbp5.mnist_spiketrain_sliding import SpikeTrainMNIST
 
 logger = logging.getLogger(__name__)
