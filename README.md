@@ -1,4 +1,7 @@
 # BNN EEG
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22931817.svg)](https://doi.org/10.5281/zenodo.22931817)
+
+Biologically Interpretable Machine Learning Approaches for Analyzing Neural Data
 
 Python-based project for Biological Neural Network modeling and analysis for EEG/MNIST dataset. 
 
@@ -74,3 +77,5 @@ The `bnbp5` directory contains:
 ## License
 
 The custom analysis code supporting the findings of this study is openly available in `https://github.com/mccruz22/BNN-EEG`, under MIT License Copyright (c) 2026 Madelyn Cruz license.
+
+
