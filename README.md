@@ -78,4 +78,5 @@ The `bnbp5` directory contains:
 
 The custom analysis code supporting the findings of this study is openly available in `https://github.com/mccruz22/BNN-EEG`, under MIT License Copyright (c) 2026 Madelyn Cruz license.
 
+This repository provides a reference/ illustrative implementation of the methods described in the paper Biologically Interpretable Machine Learning Approaches for Analyzing Neural Data. It is not the production system used in ongoing research.
 
