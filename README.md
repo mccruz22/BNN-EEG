@@ -1,5 +1,7 @@
 # BNN EEG
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22931816.svg)](https://doi.org/10.5281/zenodo.22931816)
+
 Biologically Interpretable Machine Learning Approaches for Analyzing Neural Data
 
 Python-based project for Biological Neural Network modeling and analysis for EEG/MNIST dataset. 
